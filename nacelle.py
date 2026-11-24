@@ -6840,7 +6840,8 @@ def exhaust_check(rng, lmax=3):
 
 SR, SC, SS = sp.symbols("r c s", real=True)
 # the depth r - 1 into a wall from r = 1 to r = 2, in which the certificates write their rational functions: in r
-# their coefficients reach 1e15 with alternating signs, and the interval tactic must cut the wall far finer
+# their coefficients reach 1e15 with alternating signs, Interval's bisection must cut the wall far finer, and field's
+# normalisation expands every power of r - 1
 SX = sp.Symbol("x", real=True)
 ORTHO = "EadSxTP"
 
@@ -6887,6 +6888,219 @@ def rocq_frac(e):
     num = in_depth(num)
     num = horner2(num, SX, SC) if num.has(SX) else num
     return rocq_expr(num) if den == 1 else "%s / %s" % (rocq_expr(num), rocq_expr(sp.factor(in_depth(den))))
+
+
+# The definitions of nacelle.v's section 5 that a certificate's rows unfold, as they read once the section is
+# closed: the section's variables E a d Sr x Th Ph that a body uses come first, in that order.
+SECTION_FORMS = {
+    "D00": ("E a d lam", "- lam + E*E - a*a - d*d"),
+    "D01": ("E a d Sr x", "E*a - a*Sr - d*x"),
+    "D02": ("E a d x Th", "E*d - a*x - d*Th"),
+    "D11": ("a Sr x lam", "lam + a*a - Sr*Sr - x*x"),
+    "D12": ("a d Sr x Th", "a*d - x*(Sr + Th)"),
+    "D22": ("d x Th lam", "lam + d*d - x*x - Th*Th"),
+    "D33": ("Ph lam", "lam - Ph*Ph"),
+    "trace": ("E Sr Th Ph", "- E + Sr + Th + Ph"),
+}
+WALL = (("var", 0), ("var", 1))  # the trees of r and c on the wall
+# The atoms of field's expressions: the depth r - 1, in which field normalises, then r, c and s.
+DEPTH = {"r": ("var", 1), "c": ("var", 2), "s": ("var", 3)}
+DEPTH_ATOM = ("op2", "Sub", ("var", 1), ("int", 1))
+
+
+def term_tree(text, forms, values, shared=None, standard=WALL):
+    """The tree of the Rocq term `text` over the reals, as the reifiers of Interval and of field build it, so that
+    the tree's value converts to the term.
+
+    `forms` maps a definition's name to its parameters and body, which are unfolded, and `values` a variable to
+    its tree. `shared` maps a definition to the name of its tree where it is applied to the trees `standard`, or to
+    the first of them. A tree is a nested tuple, written out by `tree_text` for Interval and `field_text` for
+    field; `x * x` is a square, as Interval's reifier has it.
+    """
+    tokens = re.findall(r"[A-Za-z_][\w']*|\d+|\S", text)
+    at = [0]
+
+    def peek():
+        return tokens[at[0]] if at[0] < len(tokens) else None
+
+    def take():
+        at[0] += 1
+        return tokens[at[0] - 1]
+
+    def total():
+        left = product()
+        while peek() in ("+", "-"):
+            left = ("op2", "Add" if take() == "+" else "Sub", left, product())
+        return left
+
+    def product():
+        left = unary()
+        while peek() in ("*", "/"):
+            op = "Mul" if take() == "*" else "Div"
+            right = unary()
+            left = ("op1", "Sqr", left) if op == "Mul" and right == left else ("op2", op, left, right)
+        return left
+
+    def unary():
+        # Rocq reads a minus sign before a numeral as a negative numeral
+        if peek() == "-":
+            take()
+            x = unary()
+            return ("int", -x[1]) if x[0] == "int" and x[1] > 0 else ("op1", "Neg", x)
+        if peek() == "/":
+            take()
+            return ("op1", "Inv", unary())
+        x = application()
+        if peek() == "^":
+            take()
+            return ("pow", int(take()), x)
+        return x
+
+    def application():
+        token = take()
+        if token == "(":
+            x = total()
+            take()
+            return x
+        if token.isdigit():
+            return ("int", int(token))
+        if token in ("Rabs", "sqrt"):
+            return ("op1", "Abs" if token == "Rabs" else "Sqrt", application())
+        if token in values:
+            return values[token]
+        params, body = forms[token]
+        args = [application() for _ in params]
+        if shared and token in shared and tuple(args) == standard[: len(args)]:
+            return ("ref", shared[token])
+        return term_tree(body, forms, dict(zip(params, args)), shared, standard)
+
+    return total()
+
+
+def tree_text(tree):
+    """Rocq source for a tree of `term_tree`, as Interval's Tree.expr."""
+    kind = tree[0]
+    if kind == "int":
+        return "(Tree.Econst (Tree.Int %s))" % (tree[1] if tree[1] >= 0 else "(%d)" % tree[1])
+    if kind == "var":
+        return "(Tree.Evar %d)" % tree[1]
+    if kind == "ref":
+        return tree[1]
+    if kind == "pow":
+        return "(Tree.Eunary (Tree.PowerInt %d) %s)" % (tree[1], tree_text(tree[2]))
+    if kind == "op1":
+        return "(Tree.Eunary Tree.%s %s)" % (tree[1], tree_text(tree[2]))
+    return "(Tree.Ebinary Tree.%s %s %s)" % (tree[1], tree_text(tree[2]), tree_text(tree[3]))
+
+
+def field_text(tree):
+    """Rocq source for a tree of `term_tree`, as field's FExpr over Z; the variable k is the list's (k + 1)th, and
+    r - 1 is the first."""
+    if tree == DEPTH_ATOM:
+        return "(FEX _ 1)"
+    kind = tree[0]
+    if kind == "int":
+        return "(FEc %s%%Z)" % (tree[1] if tree[1] >= 0 else "(%d)" % tree[1])
+    if kind == "var":
+        return "(FEX _ %d)" % (tree[1] + 1)
+    if kind == "ref":
+        return tree[1]
+    if kind == "pow":
+        return "(FEpow %s (Npos %d))" % (field_text(tree[2]), tree[1])
+    if kind == "op1":
+        inner = field_text(tree[2])
+        return {"Sqr": "(FEmul %s %s)" % (inner, inner), "Neg": "(FEopp %s)" % inner, "Inv": "(FEinv %s)" % inner}[tree[1]]
+    return "(FE%s %s %s)" % (tree[1].lower(), field_text(tree[2]), field_text(tree[3]))
+
+
+# What the certificates' rows and closed forms are proved with: Interval's bisection and field's normalisation,
+# which their tactics run on the trees they reify, run here on the trees that `term_tree` writes, and checked once,
+# by the kernel at Qed.
+CERTIFICATE_LEMMAS = """\
+(* Interval's bisection on the tree of an expression.  The rows of the certificates below are proved with it:
+   nacelle shells certify writes each row's tree, which Interval's tactic would build by reification, and the
+   kernel runs the bisection once, at Qed, on its virtual machine. *)
+Lemma tree_bound e vars hyps g prec depth idx :
+  match Prog.extract e (length vars) with
+  | Prog.Eabort => false
+  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect prec depth idx hyps lp lc g
+  end = true ->
+  Reify.eval_hyps hyps vars (Reify.eval_goal g (Tree.eval e vars)).
+Proof.
+  intros H. generalize (Prog.extract_correct e vars).
+  destruct (Prog.extract e (length vars)) as [|lp lc]; [discriminate |].
+  intros <-. exact (Private.IT2.IH.eval_bisect_correct prec depth idx vars hyps lp lc g H).
+Qed.
+
+(* the wall 1 <= r <= 2, -1 <= c <= 1, cut in r and in c to a depth of 40, and the goal 0 <= e *)
+Definition wall_hyps : list (list Reify.hyp) :=
+  ((Reify.Hlele true true (Tree.Econst (Tree.Int 1)) (Tree.Econst (Tree.Int 2)) :: nil)
+   :: (Reify.Hlele true true (Tree.Econst (Tree.Int (-1))) (Tree.Econst (Tree.Int 1)) :: nil) :: nil)%list.
+
+Definition wall_goal : Reify.gol := Reify.Gge true (Tree.Econst (Tree.Int 0)).
+
+Definition wall_check (e : Tree.expr) : bool :=
+  match Prog.extract e 2 with
+  | Prog.Eabort => false
+  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect 53%Z 40 (0%nat :: 1%nat :: nil)%list wall_hyps lp lc wall_goal
+  end.
+
+Lemma wall_nonneg e : wall_check e = true ->
+  forall r c, 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= Tree.eval e (r :: c :: nil).
+Proof.
+  intros H r c.
+  exact (tree_bound e (r :: c :: nil)%list wall_hyps wall_goal 53%Z 40 (0%nat :: 1%nat :: nil)%list H).
+Qed.
+
+Ltac wall e r c :=
+  let H := fresh in
+  assert (H : wall_check e = true) by vm_cast_no_check (eq_refl true);
+  exact_no_check (wall_nonneg e H r c).
+
+(* field's normalisation of the two sides of an identity in r, c and s, written out as field's expressions over the
+   atoms r - 1, r, c and s, with r replaced by (r - 1) + 1, so that the normal forms are polynomials in the depth
+   r - 1.  The closed forms of the certificates below are proved with it, the kernel comparing the normal forms
+   once, at Qed, and the denominators shown nonzero by Interval. *)
+Definition depth_subst : list (Ring_polynom.PExpr BinNums.Z * Ring_polynom.PExpr BinNums.Z) :=
+  ((Ring_polynom.PEX _ 2, Ring_polynom.PEadd (Ring_polynom.PEX _ 1) (Ring_polynom.PEc 1%Z)) :: nil)%list.
+
+Definition field_check (fe1 fe2 : FExpr BinNums.Z) : bool :=
+  let lmp := Ring_polynom.mk_monpol_list 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb Z.quotrem depth_subst in
+  let n1 := Fnorm 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb fe1 in
+  let n2 := Fnorm 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb fe2 in
+  Ring_polynom.Peq Z.eqb
+    (Ring_polynom.norm_subst 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb Z.quotrem ring_subst_niter lmp
+       (Ring_polynom.PEmul (num n1) (denum n2)))
+    (Ring_polynom.norm_subst 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb Z.quotrem ring_subst_niter lmp
+       (Ring_polynom.PEmul (num n2) (denum n1))).
+
+Definition field_conds (l : list R) (fe1 fe2 : FExpr BinNums.Z) : Prop :=
+  PCond 0 1 Rplus Rmult Rminus Ropp eq IZR BinNat.N.to_nat pow l
+    (condition (Fnorm 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb fe1)
+     ++ condition (Fnorm 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb fe2)).
+
+Lemma field_identity r c s fe1 fe2 :
+  field_check fe1 fe2 = true -> field_conds (r - 1 :: r :: c :: s :: nil)%list fe1 fe2 ->
+  FEeval 0 1 Rplus Rmult Rminus Ropp Rdiv RinvImpl.Rinv IZR BinNat.N.to_nat pow (r - 1 :: r :: c :: s :: nil)%list fe1 =
+  FEeval 0 1 Rplus Rmult Rminus Ropp Rdiv RinvImpl.Rinv IZR BinNat.N.to_nat pow (r - 1 :: r :: c :: s :: nil)%list fe2.
+Proof.
+  intros H C.
+  refine (RField_field_lemma1 ring_subst_niter _ depth_subst fe1 fe2 _ _ eq_refl _ eq_refl _ eq_refl H C).
+  cbn. ring.
+Qed.
+
+Ltac nonzero := repeat split; first [ lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
+
+Ltac identity r c s fe1 fe2 :=
+  let N := fresh in
+  let C := fresh in
+  assert (N : field_check fe1 fe2 = true) by vm_cast_no_check (eq_refl true);
+  assert (C : field_conds (r - 1 :: r :: c :: s :: nil)%list fe1 fe2)
+    by (unfold field_conds; apply RField_lemma5; intros lock lock_def; vm_compute; rewrite lock_def;
+        clear lock lock_def; cbn [PCond Ring_polynom.PEeval BinList.nth BinList.jump List.tl List.hd
+                                  BinNat.N.to_nat BinPos.Pos.to_nat BinPos.Pos.iter_op Nat.add]; nonzero);
+  exact_no_check (field_identity r c s fe1 fe2 N C).
+"""
 
 
 def drag_closed_jets(M, b):
@@ -6972,6 +7186,7 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None):
     jetnames = [a for a in argnames if a not in ("r", "c", "s", "b", "b_t")]
     gen, X = closed_shell(family, jets)
     tag = {k: ("%d%d" % k if isinstance(k, tuple) else k) for k in keys}
+    forms = {name: (params.split(), body) for name, (params, body) in SECTION_FORMS.items()}
     L = ["(* %s" % note, "",
          "   G_* are the components of 8 pi T for the %s family in terms of the jets of its profile" % family,
          "   functions.  Proved here: the components on this shell, the null, weak, strong and dominant energy",
@@ -6980,11 +7195,12 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None):
     binder = "(r c s %s : R)" % " ".join(jetnames)
     for k in keys:
         num, den = sp.fraction(gen[k])
-        L += ["Definition G_%s %s : R :=\n  %s / %s." % (tag[k], binder, rocq_expr(num), rocq_expr(den)), ""]
+        forms["G_" + tag[k]] = (["r", "c", "s"] + jetnames, "%s / %s" % (rocq_expr(num), rocq_expr(den)))
+        L += ["Definition G_%s %s : R :=\n  %s." % (tag[k], binder, forms["G_" + tag[k]][1]), ""]
     for nm in jetnames:
-        L.append("Definition j_%s (r : R) : R := %s." % (nm, rocq_frac(jets[nm])))
+        forms["j_" + nm] = (["r"], rocq_frac(jets[nm]))
+        L.append("Definition j_%s (r : R) : R := %s." % (nm, forms["j_" + nm][1]))
     L.append("")
-    unfold_x = []
     for k in keys:
         num, den = sp.fraction(X[k])
         num = sp.expand(num)
@@ -6993,36 +7209,56 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None):
             num = sp.expand(sp.cancel(num / SS))
             if num.has(SS):
                 raise ValueError("component %s is not linear in s" % (k,))
-        body = "%s / %s" % (rocq_expr(horner2(in_depth(num), SX, SC)), rocq_expr(sp.factor(in_depth(den))))
-        L += ["Definition x_%s (r c s : R) : R := %s%s." % (tag[k], "s * " if odd else "", "(%s)" % body), ""]
-        unfold_x.append("x_%s" % tag[k])
-    L += ["Ltac nonzero := repeat split; first [ lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].", ""]
+        body = "%s(%s / %s)" % ("s * " if odd else "", rocq_expr(horner2(in_depth(num), SX, SC)),
+                                 rocq_expr(sp.factor(in_depth(den))))
+        L += ["Definition x_%s (r c s : R) : R := %s." % (tag[k], body), ""]
+        forms["x_%s" % tag[k]] = (["r", "c", "s"], body)
+    # field's expressions of the jets, which those of the closed forms' two sides name
+    L.append("(* field's expressions of the jets, of which those of the identities below are built *)")
     jl = " ".join("(j_%s r)" % nm for nm in jetnames)
+    fshared = {}
+    for nm in jetnames:
+        tree = term_tree(forms["j_" + nm][1], forms, {"r": DEPTH["r"]})
+        fshared["j_" + nm] = "fe_" + nm
+        L.append("Definition fe_%s : FExpr BinNums.Z := %s." % (nm, field_text(tree)))
+    L.append("")
     for k in keys:
-        L += ["Lemma x_%s_closed r c s : 1 <= r <= 2 -> G_%s r c s %s = x_%s r c s." % (tag[k], tag[k], jl, tag[k]),
-              "Proof.", "  intros Hr. unfold G_%s, x_%s, %s." % (tag[k], tag[k], ", ".join("j_" + nm for nm in jetnames)),
-              "  field; nonzero.", "Qed.", ""]
+        lhs, rhs = "G_%s r c s %s" % (tag[k], jl), "x_%s r c s" % tag[k]
+        for name, side in (("G", lhs), ("x", rhs)):
+            text = field_text(term_tree(side, forms, DEPTH, fshared, (DEPTH["r"],)))
+            L.append("Definition fe_%s_%s : FExpr BinNums.Z := %s." % (name, tag[k], text))
+        L += ["Lemma x_%s_closed r c s : 1 <= r <= 2 -> %s = %s." % (tag[k], lhs, rhs),
+              "Proof. intros Hr. identity r c s fe_G_%s fe_x_%s. Qed." % (tag[k], tag[k]), ""]
     xs = {k: "x_%s r c (sqrt (1 - c * c))" % tag[k] for k in keys}
-    unfold = list(unfold_x)
     if family == "drag":
         body = dict(zip(ORTHO, [xs[k] for k in keys]))
     else:
         L += ["(* the frame is (q k + l/q)/sqrt2, (q k - l/q)/sqrt2, e_th, e_ph with q^2 = H0/2 *)",
               "Definition H0 (r : R) : R := %s." % rocq_frac(H0), "",
               "Lemma H0_positive r : 1 <= r <= 2 -> 0 < H0 r.", "Proof. intros Hr. unfold H0. interval. Qed.", ""]
+        forms["H0"] = (["r"], rocq_frac(H0))
         ckk, ckl, cll, ck2, cl2, c22, c33 = [xs[k] for k in keys]
         body = {"E": "(H0 r * (%s) / 2 + 2 * (%s) + 2 * (%s) / H0 r) / 2" % (ckk, ckl, cll),
                 "a": "(H0 r * (%s) / 2 - 2 * (%s) / H0 r) / 2" % (ckk, cll),
                 "d": "(H0 r * (%s) / 2 + %s) / sqrt (H0 r)" % (ck2, cl2),
                 "S": "(H0 r * (%s) / 2 - 2 * (%s) + 2 * (%s) / H0 r) / 2" % (ckk, ckl, cll),
                 "x": "(H0 r * (%s) / 2 - (%s)) / sqrt (H0 r)" % (ck2, cl2), "T": c22, "P": c33}
-        unfold.append("H0")
     L.append("(* the components at radius r and c = cos(theta), with sin(theta) = sqrt (1 - c^2) *)")
     for k in ORTHO:
         L.append("Definition t%s (r c : R) : R := %s." % (k, body[k]))
-    L += ["", "Definition rho (r : R) : R := %s." % rocq_frac(rho),
-          "Definition mu (r : R) : R := %s * rho r." % rocq_expr(k1),
-          "Definition lam (r : R) : R := %s * (rho r * rho r)." % rocq_expr(k2), ""]
+        forms["t" + k] = (["r", "c"], body[k])
+    forms.update(rho=(["r"], rocq_frac(rho)), mu=(["r"], "%s * rho r" % rocq_expr(k1)),
+                 lam=(["r"], "%s * (rho r * rho r)" % rocq_expr(k2)))
+    L += [""] + ["Definition %s (r : R) : R := %s." % (name, forms[name][1]) for name in ("rho", "mu", "lam")] + [""]
+    # Interval's trees of the density and the components, which the rows' trees name
+    L.append("(* the trees of rho and of the components, of which the rows' trees are built *)")
+    shared = {}
+    for name in ["rho"] + (["H0"] if "H0" in forms else []) + ["t" + k for k in ORTHO]:
+        params, text = forms[name]
+        tree = term_tree(text, forms, dict(zip(params, WALL)), shared)
+        shared[name] = "tree_" + (name[1:] if name[0] == "t" else name)
+        L.append("Definition %s : Tree.expr := %s." % (shared[name], tree_text(tree)))
+    L.append("")
     g = {k: "(t%s r c)" % k for k in ORTHO}
 
     def app(f, ks, extra=""):
@@ -7040,12 +7276,10 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None):
             ("d1", "%s - Rabs (%s) - Rabs (%s)" % (D["D11"], D["D01"], D["D12"])),
             ("d2", "%s - Rabs (%s) - Rabs (%s)" % (D["D22"], D["D02"], D["D12"])),
             ("d3", D["D33"]), ("l", "lam r")]
-    un = "unfold D00, D01, D02, D11, D12, D22, D33, trace, mu, lam, rho, %s, %s" % (
-        ", ".join("t" + k for k in ORTHO), ", ".join(unfold))
     for nm, stmt in rows:
-        # with i_delay the bisection is computed once, by the kernel at Qed, and not by the tactic as well
-        L += ["Lemma row_%s r c : 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= %s." % (nm, stmt), "Proof.",
-              "  intros Hr Hc. %s." % un, "  interval with (i_bisect r, i_bisect c, i_depth 40, i_delay).", "Qed.", ""]
+        tree = tree_text(term_tree(stmt, forms, {"r": WALL[0], "c": WALL[1]}, shared))
+        L += ["Lemma row_%s r c : 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= %s." % (nm, stmt),
+              "Proof. wall %s r c. Qed." % tree, ""]
     allg = " ".join(g[k] for k in ORTHO)
     w = [app("w0", "Ead"), app("w1", "aSx"), app("w2", "dxT"), app("w3", "P")]
     kk = " k0 k1 k2 k3"
@@ -7196,6 +7430,7 @@ def cmd_certify(args):
     L = [CERTIFIED,
          "   G_* are the components of 8 pi T in terms of the jets of the profile functions, as derived by nacelle",
          "   shells derive and compared with automatic differentiation of the metric by nacelle shells selftest. *)", ""]
+    L += CERTIFICATE_LEMMAS.splitlines() + [""]
     L += face_module()
     L += certificate_module("Drag", "drag", jets, rho, k1, k2,
                             "Drag shell on 1 <= r <= 2 with M = %s and shift amplitude %s." % (M, b))
