@@ -143,50 +143,9 @@ def _cylinder(x, center, axis, width):
 
 
 @pytree
-class Ring:
-    """A torus wall: a tube of half-width `width` around a circle of `radius` about `axis`."""
-
-    center: Array
-    axis: Array
-    radius: Array
-    width: Array
-
-    def _offset2(self, x):
-        z, rho, soft = _cylinder(x, self.center, self.axis, self.width)
-        return (rho - jnp.sqrt(self.radius**2 + soft)) ** 2 + z**2
-
-    def log_profile(self, x):
-        return -0.5 * self._offset2(x) / self.width**2
-
-    def profile(self, x):
-        return jnp.exp(self.log_profile(x))
-
-    def distance(self, x):
-        return jnp.sqrt(self._offset2(x))
-
-    def reach(self, x):
-        """Distance from the wall in units of its half-width."""
-        return self.distance(x) / self.width
-
-    def thinnest(self):
-        """The smallest half-width of the wall."""
-        return self.width
-
-    def problems(self) -> list[str]:
-        """What is wrong with the parameters, one message per fault."""
-        found = []
-        if not float(self.width) > 0.0:
-            found.append("width must be positive")
-        if not float(self.radius) > 0.0:
-            found.append("radius must be positive")
-        if not float(jnp.sum(jnp.asarray(self.axis, dtype=float) ** 2)) > 0.0:
-            found.append("axis must be nonzero")
-        return found
-
-
-@pytree
 class RingStack:
-    """Rings on one axis: ring i sits at `offsets[i]` along `axis` from `center` with radius `radii[i]`."""
+    """Rings on one axis, each a tube of half-width `width`: ring i sits at `offsets[i]` along `axis` from `center`
+    with radius `radii[i]`."""
 
     center: Array
     axis: Array
@@ -210,12 +169,15 @@ class RingStack:
         return jnp.sqrt(jnp.min(self._offset2(x)))
 
     def reach(self, x):
+        """Distance from the wall in units of its half-width."""
         return self.distance(x) / self.width
 
     def thinnest(self):
+        """The smallest half-width of the wall."""
         return self.width
 
     def problems(self) -> list[str]:
+        """What is wrong with the parameters, one message per fault."""
         found = []
         radii = jnp.atleast_1d(jnp.asarray(self.radii, dtype=float))
         offsets = jnp.atleast_1d(jnp.asarray(self.offsets, dtype=float))
@@ -228,6 +190,11 @@ class RingStack:
         if not float(jnp.sum(jnp.asarray(self.axis, dtype=float) ** 2)) > 0.0:
             found.append("axis must be nonzero")
         return found
+
+
+def Ring(center, axis, radius, width) -> RingStack:  # noqa: N802, the constructor of a wall
+    """A torus wall: a tube of half-width `width` around a circle of `radius` about `axis`, the stack of one ring."""
+    return RingStack(center=center, axis=axis, offsets=(0.0,), radii=(radius,), width=width)
 
 
 @pytree
@@ -549,10 +516,7 @@ class Design:
 
     def scalar(self, x):
         """The scalar field at the point x."""
-        total = 0.0
-        for part in self.parts:
-            total = total + part.amplitude * part.shape.profile(x)
-        return total
+        return sum(part.field(x) for part in self.parts)
 
     def momentum(self, x):
         """The field's conformal momentum at x: each part's field carried along at its velocity.
@@ -570,10 +534,7 @@ class Design:
 
     def mass_density(self, x):
         """The rest-mass density of the solid at the point x, the hull being unstrained."""
-        total = 0.0
-        for part in self.parts:
-            total = total + part.density * part.shape.profile(x)
-        return total
+        return sum(part.mass(x) for part in self.parts)
 
     def log_density(self, x):
         """The logarithm of `mass_density` at the point x, a number however far x is from the walls."""
@@ -2362,28 +2323,16 @@ class Solution:
         return self.curvature.sample(level, region)
 
 
-def scalar_fields(design, axes, batch: int = 1 << 16):
-    """The scalar field and its flat-space gradient energy |grad phi|^2 / 2 on the grid of `axes`."""
-    x, y, z = jnp.meshgrid(*axes, indexing="ij")
-    points = jnp.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1)
-    phi, grad = jax.lax.map(jax.value_and_grad(design.scalar), points, batch_size=batch)
-    return phi.reshape(x.shape), 0.5 * jnp.sum(grad * grad, axis=-1).reshape(x.shape)
+def on_grid(function, axes, batch: int = 1 << 16):
+    """`function` at every point of the grid that `axes` span, each output an array of the grid's shape followed by
+    its own."""
+    grid = jnp.meshgrid(*axes, indexing="ij")
+    points = jnp.stack([g.ravel() for g in grid], axis=-1)
+    values = jax.lax.map(function, points, batch_size=batch)
+    return jax.tree.map(lambda v: v.reshape(grid[0].shape + v.shape[1:]), values)
 
 
-def moving_fields(design, axes, batch: int = 1 << 16):
-    """The scalar field, its flat-space gradient (three components first) and its conformal momentum on the grid."""
-    x, y, z = jnp.meshgrid(*axes, indexing="ij")
-    points = jnp.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1)
-
-    def at(point):
-        phi, grad = jax.value_and_grad(design.scalar)(point)
-        return phi, grad, design.momentum(point)
-
-    phi, grad, rate = jax.lax.map(at, points, batch_size=batch)
-    return phi.reshape(x.shape), jnp.moveaxis(grad, -1, 0).reshape((3,) + x.shape), rate.reshape(x.shape)
-
-
-def hull_sources(design, axes, batch: int = 1 << 16):
+def hull_sources(design, axes):
     """The hull's energy and momentum on the grid of `axes`, as `hull_terms` gives them.
 
     Returns the coefficient fields of the hull's powers of psi in
@@ -2392,9 +2341,7 @@ def hull_sources(design, axes, batch: int = 1 << 16):
     stretched by the curvature it sits in and has no momentum. The thin
     material between the walls is left out.
     """
-    x, y, z = jnp.meshgrid(*axes, indexing="ij")
-    points = jnp.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1)
-    density = jax.lax.map(design.mass_density, points, batch_size=batch).reshape(x.shape)
+    density = on_grid(design.mass_density, axes)
     velocity = design.hull_velocity()
     energy, momentum = hull_terms(design.solid, velocity)
 
@@ -2402,40 +2349,61 @@ def hull_sources(design, axes, batch: int = 1 << 16):
         factor = sum(a * psi**n for a, n in zip(momentum, HULL_MOMENTUM_POWERS))
         return density * factor * velocity[:, None, None, None]
 
-    return tuple(density * a for a in energy), HULL_ENERGY_POWERS, current
+    return [density * a for a in energy], list(HULL_ENERGY_POWERS), current
 
 
-def scalar_coefficients(design, fine: FineGrid):
-    """Coefficient fields and powers of psi for a design at rest.
+def matter_terms(design, axes):
+    """The design's matter on the grid of `axes`: the coefficient fields c_k and the powers n_k of its part of
+    sum_k c_k psi^(n_k), and a function from psi to the three components of its conformal momentum density, None for
+    a design at rest.
 
     The scalar field's energy density is psi^-4 |grad phi|^2 / 2 + V(phi) with
-    V = m^2 phi^2 / 2, which enters laplacian(psi) = -2 pi psi^5 rho with the
-    powers 1 and 5; a solid adds the terms of `hull_sources`.
+    V = m^2 phi^2 / 2, and psi^-12 Pi~^2 / 2 more for a field with the
+    conformal momentum Pi~, which enter laplacian(psi) = -2 pi psi^5 rho with
+    the powers 1, 5 and -7; a solid adds the terms of `hull_sources`.
     """
+    moving = design.moving()
+
+    def at(point):
+        phi, grad = jax.value_and_grad(design.scalar)(point)
+        return (phi, grad, design.momentum(point)) if moving else (phi, grad)
+
+    phi, grad, *rate = on_grid(at, axes)
+    coefficients = [0.5 * jnp.sum(grad * grad, axis=-1), 0.5 * design.scalar_mass**2 * phi * phi]
+    exponents = [1, 5]
+    if moving:
+        coefficients.append(0.5 * rate[0] * rate[0])
+        exponents.append(-7)
+    hull_current = None
+    if design.has_solid():
+        more, powers, hull_current = hull_sources(design, axes)
+        coefficients, exponents = coefficients + more, exponents + powers
+    if not moving:
+        return coefficients, exponents, None
+    field_current = -rate[0] * jnp.moveaxis(grad, -1, 0)
+    if hull_current is None or not design.hull_moves():
+        return coefficients, exponents, lambda psi: field_current
+    return coefficients, exponents, lambda psi: field_current + hull_current(psi)
+
+
+def _solve_at_rest(design, fine: FineGrid, kernel):
+    """psi - 1 of a design at rest on the fine grid, differentiably, with the coefficients and powers of its source."""
     if design.moving():
         raise ValueError("the differentiable solve covers designs at rest; solve_design handles one with momentum")
-    phi, gradient_energy = scalar_fields(design, fine.axes())
-    potential_energy = 0.5 * design.scalar_mass**2 * phi * phi
-    coefficients, exponents = (gradient_energy, potential_energy), (1, 5)
-    if design.has_solid():
-        more, powers, _ = hull_sources(design, fine.axes())
-        coefficients, exponents = coefficients + more, exponents + powers
-    return coefficients, exponents
+    coefficients, exponents, _ = matter_terms(design, fine.axes())
+    kernel = fine.kernel() if kernel is None else kernel
+    u, _ = solve_conformal_factor(lambda u: source_density(u, coefficients, exponents), kernel)
+    return u, coefficients, exponents
 
 
 def conformal_factor(design, fine: FineGrid, kernel=None):
     """u = psi - 1 on the fine grid, differentiable with respect to the design."""
-    kernel = fine.kernel() if kernel is None else kernel
-    coefficients, exponents = scalar_coefficients(design, fine)
-    u, _ = solve_conformal_factor(lambda u: source_density(u, coefficients, exponents), kernel)
-    return u
+    return _solve_at_rest(design, fine, kernel)[0]
 
 
 def design_mass(design, fine: FineGrid, kernel=None):
     """The ADM mass of the design, differentiable with respect to the design."""
-    kernel = fine.kernel() if kernel is None else kernel
-    coefficients, exponents = scalar_coefficients(design, fine)
-    u, _ = solve_conformal_factor(lambda u: source_density(u, coefficients, exponents), kernel)
+    u, coefficients, exponents = _solve_at_rest(design, fine, kernel)
     return adm_mass(u, coefficients, exponents, fine.h)
 
 
@@ -2469,6 +2437,13 @@ def _taper(inner: Region, outer: Region) -> np.ndarray:
     return factors[0][:, None, None] * factors[1][None, :, None] * factors[2][None, None, :]
 
 
+def edge_share(source) -> float:
+    """The largest magnitude of a box's source on its faces as a fraction of the largest anywhere in it."""
+    magnitude = np.abs(source)
+    faces = [magnitude[0], magnitude[-1], magnitude[:, 0], magnitude[:, -1], magnitude[:, :, 0], magnitude[:, :, -1]]
+    return float(max(face.max() for face in faces) / magnitude.max())
+
+
 def _solve_moving(design, fine: FineGrid, plan: Plan | None, memory: Memory) -> Solution:
     """`solve_design` for a design with momentum.
 
@@ -2494,18 +2469,12 @@ def _solve_moving(design, fine: FineGrid, plan: Plan | None, memory: Memory) -> 
         raise ValueError("a design with momentum is solved over its domain; pass a plan with a limit")
     region, h, h0 = fine.region, fine.h, plan.h[0]
     blur = FILTER_CELLS * h0
-    phi, gradient, rate = moving_fields(design, fine.axes())
-    energy = 0.5 * jnp.sum(gradient * gradient, axis=0)
-    potential_energy = 0.5 * design.scalar_mass**2 * phi * phi
-    kinetic = 0.5 * rate * rate
-    field_current = -rate * gradient
-    hull = hull_sources(design, fine.axes()) if design.has_solid() else None
-    hull_moves = hull is not None and design.hull_moves()
+    coefficients, exponents, current = matter_terms(design, fine.axes())
+    hull_moves = design.has_solid() and design.hull_moves()
 
     def current_at(psi):
         """The three components of the conformal momentum density at the conformal factor psi."""
-        total = field_current if not hull_moves else field_current + hull[2](psi)
-        return [np.asarray(total[axis]) for axis in range(3)]
+        return [np.asarray(component) for component in current(psi)]
 
     # the curvature of the blurred sources, which away from the matter is that of the sharp ones
     matched = CURVATURE.for_blur(blur)
@@ -2527,16 +2496,11 @@ def _solve_moving(design, fine: FineGrid, plan: Plan | None, memory: Memory) -> 
     sources = current_at(jnp.ones(region.shape))
     sharp, soft, system, far_square = curvature_of(sources)
 
-    def matter_part(psi):
-        total = energy * psi + potential_energy * psi**5 + kinetic * psi**-7
-        if hull is not None:
-            total = total + sum(c * psi**n for c, n in zip(hull[0], hull[1]))
-        return 2.0 * math.pi * total
-
     def near(u, v):
         """The fine grid's part of -laplacian(psi), from psi - 1 and its blurred counterpart."""
-        psi, psi_b = 1.0 + jnp.asarray(u), 1.0 + jnp.asarray(v)
-        return matter_part(psi) + 2.0 * math.pi * (sharp * psi**-7 - soft * psi_b**-7)
+        u, v = jnp.asarray(u), jnp.asarray(v)
+        curvature_part = sharp * (1.0 + u) ** -7 - soft * (1.0 + v) ** -7
+        return source_density(u, coefficients, exponents) + 2.0 * math.pi * curvature_part
 
     exact, smoothed = FineOperator(region, h, memory), FineOperator(region, h, memory, smooth=blur)
     state = np.zeros((2,) + region.shape)
@@ -2573,8 +2537,6 @@ def _solve_moving(design, fine: FineGrid, plan: Plan | None, memory: Memory) -> 
             f"and the momentum density by {shift:.3e} of its largest value"
         )
 
-    magnitude = np.abs(source)
-    faces = [magnitude[0], magnitude[-1], magnitude[:, 0], magnitude[:, -1], magnitude[:, :, 0], magnitude[:, :, -1]]
     return Solution(
         fine=fine,
         u=state[0] + far_fine,
@@ -2583,12 +2545,12 @@ def _solve_moving(design, fine: FineGrid, plan: Plan | None, memory: Memory) -> 
         adm_mass=float((h**3 * source.sum() + h0**3 * tail.sum()) / (2.0 * math.pi)),
         iterations=iterations,
         residual=residual,
-        edge_source=float(max(face.max() for face in faces) / magnitude.max()),
+        edge_source=edge_share(source),
         far=far,
         curvature=system,
         adm_momentum=tuple(float(h**3 * np.sum(component)) for component in sources),
         sweeps=sweep,
-        matter=np.asarray(matter_part(1.0 + jnp.asarray(state[0] + far_fine))),
+        matter=np.asarray(source_density(jnp.asarray(state[0] + far_fine), coefficients, exponents)),
     )
 
 
@@ -2597,7 +2559,7 @@ def solve_design(design, fine: FineGrid, plan: Plan | None = None, memory: Memor
     memory = Memory.default() if memory is None else memory
     if design.moving():
         return _solve_moving(design, fine, plan, memory)
-    coefficients, exponents = scalar_coefficients(design, fine)
+    coefficients, exponents, _ = matter_terms(design, fine.axes())
     operator = FineOperator(fine.region, fine.h, memory)
 
     def step(u):
@@ -2605,9 +2567,6 @@ def solve_design(design, fine: FineGrid, plan: Plan | None = None, memory: Memor
 
     u, iterations, residual = anderson(step, np.zeros(fine.region.shape))
     source = np.asarray(source_density(jnp.asarray(u), coefficients, exponents))
-
-    magnitude = np.abs(source)
-    faces = [magnitude[0], magnitude[-1], magnitude[:, 0], magnitude[:, -1], magnitude[:, :, 0], magnitude[:, :, -1]]
     return Solution(
         fine=fine,
         u=u,
@@ -2616,7 +2575,7 @@ def solve_design(design, fine: FineGrid, plan: Plan | None = None, memory: Memor
         adm_mass=float(adm_mass(jnp.asarray(u), coefficients, exponents, fine.h)),
         iterations=iterations,
         residual=residual,
-        edge_source=float(max(face.max() for face in faces) / magnitude.max()),
+        edge_source=edge_share(source),
     )
 
 
@@ -2664,38 +2623,31 @@ def bench_fields(design, on: Bench):
 
     Returns `source(u)`, `curvature(u)`, which gives the six components of
     A_ij and the three of the vector potential W_i, and `frozen`, the
-    `solve_conformal_factor` argument for a curvature that depends on u. The
-    field's kinetic energy and A_ij A_ij / 16 pi enter with the power -7, and
-    for a design at rest both vanish. The momentum density of a moving hull
+    `solve_conformal_factor` argument for a curvature that depends on u. To
+    the matter of `matter_terms` is added A_ij A_ij / 16 pi with the power -7,
+    which vanishes for a design at rest. The momentum density of a moving hull
     depends on psi, and the curvature with it; otherwise `frozen` is None.
     """
-    axes = on.fine.axes()
-    phi, gradient, rate = moving_fields(design, axes)
-    energy = 0.5 * jnp.sum(gradient * gradient, axis=0)
-    potential_energy = 0.5 * design.scalar_mass**2 * phi * phi
+    coefficients, exponents, current = matter_terms(design, on.fine.axes())
     period = on.coulomb.period
     nx, ny, nz = on.coulomb.shape
     multipliers = Multipliers(on.coulomb.multiplier, on.superpotential, on.gradient)
-    field_current = -rate * gradient
-    hull = hull_sources(design, axes) if design.has_solid() else None
-    coupled = hull is not None and design.hull_moves()
+    coupled = design.has_solid() and design.hull_moves()
 
-    def curvature_of(current):
-        spectra = [_rfftn(current[axis], period) for axis in range(3)]
+    def curvature_of(psi):
+        if current is None:
+            return jnp.zeros((9, nx, ny, nz))
+        spectra = [_rfftn(component, period) for component in current(psi)]
         return jnp.stack([_irfftn(field, period)[:nx, :ny, :nz] for field in CURVATURE.fields(spectra, multipliers)])
 
-    fixed = None if coupled else curvature_of(field_current)
+    fixed = None if coupled else curvature_of(None)
 
     def curvature(u):
-        return curvature_of(field_current + hull[2](1.0 + u)) if coupled else fixed
+        return curvature_of(1.0 + u) if coupled else fixed
 
     def source_with(u, fields):
-        psi = 1.0 + u
-        seventh = 0.5 * rate * rate + on.window * squared(fields[:6]) / (16.0 * math.pi)
-        total = energy * psi + potential_energy * psi**5 + seventh * psi**-7
-        if hull is not None:
-            total = total + sum(c * psi**n for c, n in zip(hull[0], hull[1]))
-        return 2.0 * math.pi * total
+        squares = on.window * squared(fields[:6]) / (16.0 * math.pi)
+        return source_density(u, coefficients + [squares], exponents + [-7])
 
     def source(u):
         return source_with(u, curvature(u))
@@ -3221,9 +3173,7 @@ def _blocks_near_walls(design, blocks: int, reach: float) -> np.ndarray:
     extent = design.domain.extent
     size = extent / blocks
     centres = -0.5 * extent + (np.arange(blocks) + 0.5) * size
-    x, y, z = np.meshgrid(centres, centres, centres, indexing="ij")
-    points = jnp.asarray(np.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1))
-    distance = np.asarray(jax.lax.map(design.reach, points, batch_size=1 << 14)).reshape(x.shape)
+    distance = np.asarray(on_grid(design.reach, (centres,) * 3, batch=1 << 14))
     slack = 0.5 * math.sqrt(3.0) * size / design.min_width()
     return distance < reach + slack
 
@@ -3683,11 +3633,10 @@ def level_fields(design, hierarchy: Hierarchy, solution, level: int, region: Reg
     derive from; for a moving hull `hull_rate`, the rate of its labels in
     flat space.
     """
-    x, y, z = np.meshgrid(*level_axes(hierarchy, level, region), indexing="ij")
-    points = jnp.asarray(np.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1))
+    axes = level_axes(hierarchy, level, region)
 
     def on_points(function):
-        return np.asarray(jax.lax.map(function, points, batch_size=1 << 16)).reshape(x.shape)
+        return np.asarray(on_grid(function, axes))
 
     fields = {"psi": solution.conformal_factor(level, region), "phi": on_points(design.scalar)}
     if design.has_solid():
@@ -9963,6 +9912,7 @@ __all__ = [
     "main",
     "margins",
     "mass_and_dragging",
+    "matter_terms",
     "nec_dual",
     "place_levels",
     "plan_levels",
@@ -9980,8 +9930,6 @@ __all__ = [
     "read_plotfile",
     "read_waves",
     "rocket_search",
-    "scalar_coefficients",
-    "scalar_fields",
     "selftest",
     "slp",
     "solid_boost",
