@@ -6675,13 +6675,30 @@ def horner2(p, x, y):
     return out
 
 
-def rocq_frac(e):
+def rocq_frac(e, integral=False):
     """Rocq source for a rational function of r: its numerator in Horner form in the depth r - 1, over its
-    denominator factored in that depth."""
+    denominator factored in that depth. With `integral` the numerator has integer coefficients and every factor
+    of the denominator a positive constant term, so that the factors that jets share read alike and field's
+    normalisation cancels them."""
     num, den = sp.fraction(sp.cancel(sp.together(e)))
+    if integral and num.free_symbols:
+        scale, num = sp.Poly(num, *sorted(num.free_symbols, key=str)).clear_denoms()
+        num, den = num.as_expr(), den * scale
     num = in_depth(num)
+    if integral:
+        coeff, bases = sp.factor_list(in_depth(den))
+        powers = []
+        for base, k in bases:
+            if base.subs(SX, 0) < 0:
+                base, coeff = -base, coeff * (-1) ** k
+            powers.append(base ** k)
+        if coeff < 0:
+            coeff, num = -coeff, -num
+        den = sp.Mul(coeff, *powers)
+    else:
+        den = sp.factor(in_depth(den))
     num = horner2(num, SX, SC) if num.has(SX) else num
-    return rocq_expr(num) if den == 1 else "%s / %s" % (rocq_expr(num), rocq_expr(sp.factor(in_depth(den))))
+    return rocq_expr(num) if den == 1 else "%s / %s" % (rocq_expr(num), rocq_expr(den))
 
 
 # The definitions of nacelle.v's section 5 that a certificate's rows unfold, as they read once the section is
@@ -6990,20 +7007,41 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
     fn, argnames, keys = FAMILIES[family]
     jetnames = [a for a in argnames if a not in ("r", "c", "s", "b", "b_t")]
     gen, X = closed_shell(family, jets)
+    # a jet that vanishes on this shell is zero in G_*, and one equal on it to an earlier jet is that jet there, with no
+    # definition or derivative of its own; G_* name the rest
+    same = {}
+    for i, nm in enumerate(jetnames):
+        if jets[nm] == 0:
+            same[nm] = 0
+        else:
+            twin = next((o for o in jetnames[:i] if o not in same and sp.cancel(jets[o] - jets[nm]) == 0), None)
+            if twin is not None:
+                same[nm] = twin
+    live = [nm for nm in jetnames if nm not in same]
+    defined = [nm for nm in jetnames if same.get(nm, 0) == 0]
+    if same:
+        table = {sp.Symbol(nm, real=True): sp.Symbol(v, real=True) if v else 0 for nm, v in same.items()}
+        gen = {k: sp.cancel(gen[k].subs(table)) for k in keys}
+    pairs = sorted({(nm.split("_")[0], v.split("_")[0]) for nm, v in same.items() if v})
+    reduced = "".join("  " + sentence for sentence, present in (
+        ("The jets that vanish on this shell are zero in G_*.", 0 in same.values()),
+        ("On this shell %s, and G_* take the jets of %s for those of %s." % (
+            ", ".join("%s = %s" % pair for pair in pairs), ", ".join(b for _, b in pairs),
+            ", ".join(a for a, _ in pairs)), pairs)) if present)
     tag = {k: ("%d%d" % k if isinstance(k, tuple) else k) for k in keys}
     forms = {name: (params.split(), body) for name, (params, body) in SECTION_FORMS.items()}
     L = ["(* %s" % note, "",
          "   G_* are the components of 8 pi T for the %s family in terms of the jets of its profile" % family,
          "   functions.  Proved here: the components on this shell, the null, weak, strong and dominant energy",
          "   conditions for every observer at every point of the wall, and that the radial jets are derivatives",
-         "   of one another. *)", "Module %s." % module, ""]
-    binder = "(r c s %s : R)" % " ".join(jetnames)
+         "   of one another.%s *)" % reduced, "Module %s." % module, ""]
+    binder = "(r c s %s : R)" % " ".join(live)
     for k in keys:
         num, den = sp.fraction(gen[k])
-        forms["G_" + tag[k]] = (["r", "c", "s"] + jetnames, "%s / %s" % (rocq_expr(num), rocq_expr(den)))
+        forms["G_" + tag[k]] = (["r", "c", "s"] + live, "%s / %s" % (rocq_expr(num), rocq_expr(den)))
         L += ["Definition G_%s %s : R :=\n  %s." % (tag[k], binder, forms["G_" + tag[k]][1]), ""]
-    for nm in jetnames:
-        forms["j_" + nm] = (["r"], rocq_frac(jets[nm]))
+    for nm in defined:
+        forms["j_" + nm] = (["r"], rocq_frac(jets[nm], integral=True))
         L.append("Definition j_%s (r : R) : R := %s." % (nm, forms["j_" + nm][1]))
     L.append("")
     for k in keys:
@@ -7020,9 +7058,9 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
         forms["x_%s" % tag[k]] = (["r", "c", "s"], body)
     # field's expressions of the jets, which those of the closed forms' two sides name
     L.append("(* field's expressions of the jets, of which those of the identities below are built *)")
-    jl = " ".join("(j_%s r)" % nm for nm in jetnames)
+    jl = " ".join("(j_%s r)" % nm for nm in live)
     fshared = {}
-    for nm in jetnames:
+    for nm in live:
         tree = term_tree(forms["j_" + nm][1], forms, {"r": DEPTH["r"]})
         fshared["j_" + nm] = "fe_" + nm
         L.append("Definition fe_%s : FExpr BinNums.Z := %s." % (nm, field_text(tree)))
@@ -7091,11 +7129,11 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
               "Proof.", "  intros Hm Ha Hk Hc. assert (0 <= m * a) by (apply Rmult_le_pos; assumption). nra.", "Qed.", ""]
     L.append("(* the radial jets are derivatives of one another *)")
     der = {"": "_r", "_r": "_rr", "_u": "_ru"}
-    for nm in jetnames:
+    for nm in defined:
         base = nm.rsplit("_", 1)
         suf = "_" + base[1] if len(base) == 2 and base[1] in ("r", "u") else ""
         root = nm[: len(nm) - len(suf)] if suf else nm
-        if suf in der and root + der[suf] in jetnames:
+        if suf in der and root + der[suf] in defined:
             L += ["Lemma j_%s_derive r : 1 <= r <= 2 -> is_derive j_%s r (j_%s r)." % (nm, nm, root + der[suf]),
                   "Proof.", "  intros Hr. unfold j_%s, j_%s. auto_derive; [ nonzero | field; nonzero ]." % (nm, root + der[suf]),
                   "Qed.", ""]
