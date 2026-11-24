@@ -3152,25 +3152,28 @@ class Telemetry
                                int a_step);
 };
 
+/// Register the derived quantity T::name, with the components T::names, which
+/// T::compute_mf computes from the state grown by the two cells of the
+/// fourth-order stencils.
+template <class T> void add_derived(int a_state_index)
+{
+    auto &derive_lst     = amrex::AmrLevel::get_derive_lst();
+    const auto &desc_lst = amrex::AmrLevel::get_desc_lst();
+    derive_lst.add(
+        T::name, amrex::IndexType::TheCellType(),
+        static_cast<int>(T::names.size()), T::names, T::compute_mf,
+        [=](const amrex::Box &box) { return amrex::grow(box, 2); },
+        &amrex::cell_quartic_interp);
+    derive_lst.addComponent(T::name, desc_lst, a_state_index, 0, NUM_VARS);
+}
+
 /// The exhaust's energy density and momentum density j_i, a derived quantity
 /// that the telemetry integrates apart from the rest of the matter's.
 struct ExhaustDensities
 {
     static inline const std::string name = "Exhaust";
-
-    static void set_up(int a_state_index)
-    {
-        auto &derive_lst     = amrex::AmrLevel::get_derive_lst();
-        const auto &desc_lst = amrex::AmrLevel::get_desc_lst();
-        const amrex::Vector<std::string> names{"rho_exhaust", "j_exhaust_1",
-                                               "j_exhaust_2", "j_exhaust_3"};
-        derive_lst.add(
-            name, amrex::IndexType::TheCellType(),
-            static_cast<int>(names.size()), names, compute_mf,
-            [=](const amrex::Box &box) { return amrex::grow(box, 2); },
-            &amrex::cell_quartic_interp);
-        derive_lst.addComponent(name, desc_lst, a_state_index, 0, NUM_VARS);
-    }
+    static inline const amrex::Vector<std::string> names{
+        "rho_exhaust", "j_exhaust_1", "j_exhaust_2", "j_exhaust_3"};
 
     // NOLINTBEGIN(bugprone-easily-swappable-parameters)
     static void compute_mf(amrex::MultiFab &a_out, int a_dcomp, int /*ncomp*/,
@@ -3217,20 +3220,8 @@ struct ExhaustDensities
 struct HullMotion
 {
     static inline const std::string name = "HullMotion";
-
-    static void set_up(int a_state_index)
-    {
-        auto &derive_lst     = amrex::AmrLevel::get_derive_lst();
-        const auto &desc_lst = amrex::AmrLevel::get_desc_lst();
-        const amrex::Vector<std::string> names{"hull_mass", "hull_flow_1",
-                                               "hull_flow_2", "hull_flow_3"};
-        derive_lst.add(
-            name, amrex::IndexType::TheCellType(),
-            static_cast<int>(names.size()), names, compute_mf,
-            [=](const amrex::Box &box) { return amrex::grow(box, 2); },
-            &amrex::cell_quartic_interp);
-        derive_lst.addComponent(name, desc_lst, a_state_index, 0, NUM_VARS);
-    }
+    static inline const amrex::Vector<std::string> names{
+        "hull_mass", "hull_flow_1", "hull_flow_2", "hull_flow_3"};
 
     // NOLINTBEGIN(bugprone-easily-swappable-parameters)
     static void compute_mf(amrex::MultiFab &a_out, int a_dcomp, int /*ncomp*/,
@@ -3297,18 +3288,6 @@ struct DeckFields
     static inline const amrex::Vector<std::string> names{
         "hull_density", "strain",       "exhaust_energy",
         "expansion",    "scalar_field", "lapse_departure"};
-
-    static void set_up(int a_state_index)
-    {
-        auto &derive_lst     = amrex::AmrLevel::get_derive_lst();
-        const auto &desc_lst = amrex::AmrLevel::get_desc_lst();
-        derive_lst.add(
-            name, amrex::IndexType::TheCellType(),
-            static_cast<int>(names.size()), names, compute_mf,
-            [=](const amrex::Box &box) { return amrex::grow(box, 2); },
-            &amrex::cell_quartic_interp);
-        derive_lst.addComponent(name, desc_lst, a_state_index, 0, NUM_VARS);
-    }
 
     // NOLINTBEGIN(bugprone-easily-swappable-parameters)
     static void compute_mf(amrex::MultiFab &a_out, int a_dcomp, int /*ncomp*/,
@@ -3449,18 +3428,6 @@ class TidalTensor : public Weyl4WithMatter<HullMatter<>>
                         vars.chi();
             }
         }
-    }
-
-    static void set_up(int a_state_index)
-    {
-        auto &derive_lst     = amrex::AmrLevel::get_derive_lst();
-        const auto &desc_lst = amrex::AmrLevel::get_desc_lst();
-        derive_lst.add(
-            name, amrex::IndexType::TheCellType(),
-            static_cast<int>(names.size()), names, compute_mf,
-            [=](const amrex::Box &box) { return amrex::grow(box, 2); },
-            &amrex::cell_quartic_interp);
-        derive_lst.addComponent(name, desc_lst, a_state_index, 0, NUM_VARS);
     }
 
     // NOLINTBEGIN(bugprone-easily-swappable-parameters)
@@ -4405,6 +4372,30 @@ amrex::Box interior_cells(const amrex::Geometry &a_geom,
     return amrex::grow(a_geom.Domain(), -boundary_cells);
 }
 
+/// What a telemetry sum over one level reads: a quantity derived from the
+/// level's state, 1 where no finer level covers a cell, the cells inside the
+/// boundary layer, and the cell size.
+struct LevelCells
+{
+    amrex::AmrLevel &level;
+    std::unique_ptr<amrex::MultiFab> derived;
+    amrex::iMultiFab uncovered;
+    amrex::Box interior;
+    amrex::Real dx;
+
+    LevelCells(amrex::Amr &a_amr, int a_level, const std::string &a_derived,
+               amrex::Real a_time, amrex::Real a_boundary_width,
+               int a_min_boundary_cells)
+        : level(a_amr.getLevel(a_level)),
+          derived(level.derive(a_derived, a_time, 0)),
+          uncovered(uncovered_cells(a_amr, a_level, *derived)),
+          interior(interior_cells(level.Geom(), a_boundary_width,
+                                  a_min_boundary_cells)),
+          dx(level.Geom().CellSize(0))
+    {
+    }
+};
+
 void write_row(const std::string &a_file_name, const char *a_header,
                int a_step, amrex::Real a_time,
                const std::vector<amrex::Real> &a_values)
@@ -4473,25 +4464,18 @@ Telemetry::norms_t Telemetry::constraint_norms(amrex::Amr &a_amr,
 
     for (int level = 0; level <= a_amr.finestLevel(); ++level)
     {
-        amrex::AmrLevel &amr_level = a_amr.getLevel(level);
-        const std::unique_ptr<amrex::MultiFab> constraints =
-            amr_level.derive(Constraints::name, a_time, 0);
-        const amrex::iMultiFab uncovered =
-            uncovered_cells(a_amr, level, *constraints);
-        const amrex::Box interior = interior_cells(
-            amr_level.Geom(), a_boundary_width, a_min_boundary_cells);
-        const Real *cell_size = amr_level.Geom().CellSize();
-        const Real cell_volume =
-            AMREX_D_TERM(cell_size[0], *cell_size[1], *cell_size[2]);
-
-        const auto &values = constraints->const_arrays();
-        const auto &masks  = uncovered.const_arrays();
+        const LevelCells cells(a_amr, level, Constraints::name, a_time,
+                               a_boundary_width, a_min_boundary_cells);
+        const amrex::Box interior = cells.interior;
+        const Real cell_volume    = cells.dx * cells.dx * cells.dx;
+        const auto &values        = cells.derived->const_arrays();
+        const auto &masks         = cells.uncovered.const_arrays();
 
         const auto result = amrex::ParReduce(
             amrex::TypeList<amrex::ReduceOpSum, amrex::ReduceOpSum,
                             amrex::ReduceOpMax, amrex::ReduceOpMax,
                             amrex::ReduceOpSum>{},
-            amrex::TypeList<Real, Real, Real, Real, Real>{}, *constraints,
+            amrex::TypeList<Real, Real, Real, Real, Real>{}, *cells.derived,
             amrex::IntVect(0),
             [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz) noexcept
                 -> amrex::GpuTuple<Real, Real, Real, Real, Real>
@@ -4552,21 +4536,15 @@ Telemetry::diagnostics_t Telemetry::diagnostics(amrex::Amr &a_amr,
 
     for (int level = 0; level <= a_amr.finestLevel(); ++level)
     {
-        amrex::AmrLevel &amr_level = a_amr.getLevel(level);
         // rho, j_1, j_2, j_3 as the level class registered them
-        const std::unique_ptr<amrex::MultiFab> densities =
-            amr_level.derive("EMTensor", a_time, 0);
-        const amrex::MultiFab &state = amr_level.get_new_data(state_index);
-        const amrex::iMultiFab uncovered =
-            uncovered_cells(a_amr, level, *densities);
-        const amrex::Box interior = interior_cells(
-            amr_level.Geom(), a_boundary_width, a_min_boundary_cells);
-        const Real dx          = amr_level.Geom().CellSize(0);
-        const Real cell_volume = dx * dx * dx;
-
-        const auto &matter = densities->const_arrays();
-        const auto &fields = state.const_arrays();
-        const auto &masks  = uncovered.const_arrays();
+        const LevelCells cells(a_amr, level, "EMTensor", a_time,
+                               a_boundary_width, a_min_boundary_cells);
+        const amrex::Box interior = cells.interior;
+        const Real dx             = cells.dx;
+        const Real cell_volume    = dx * dx * dx;
+        const auto &matter        = cells.derived->const_arrays();
+        const auto &fields = cells.level.get_new_data(state_index).const_arrays();
+        const auto &masks  = cells.uncovered.const_arrays();
 
         const auto result = amrex::ParReduce(
             amrex::TypeList<amrex::ReduceOpSum, amrex::ReduceOpSum,
@@ -4577,7 +4555,7 @@ Telemetry::diagnostics_t Telemetry::diagnostics(amrex::Amr &a_amr,
                             amrex::ReduceOpMin, amrex::ReduceOpMax>{},
             amrex::TypeList<Real, Real, Real, Real, Real, Real, Real, Real,
                             Real, Real, Real, Real>{},
-            *densities, amrex::IntVect(0),
+            *cells.derived, amrex::IntVect(0),
             [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz) noexcept
                 -> amrex::GpuTuple<Real, Real, Real, Real, Real, Real, Real,
                                    Real, Real, Real, Real, Real>
@@ -4661,24 +4639,18 @@ std::array<amrex::Real, 4> Telemetry::exhaust(amrex::Amr &a_amr,
     std::array<Real, 4> sums{};
     for (int level = 0; level <= a_amr.finestLevel(); ++level)
     {
-        amrex::AmrLevel &amr_level = a_amr.getLevel(level);
-        const std::unique_ptr<amrex::MultiFab> densities =
-            amr_level.derive(ExhaustDensities::name, a_time, 0);
-        const amrex::MultiFab &state = amr_level.get_new_data(state_index);
-        const amrex::iMultiFab uncovered =
-            uncovered_cells(a_amr, level, *densities);
-        const amrex::Box interior = interior_cells(
-            amr_level.Geom(), a_boundary_width, a_min_boundary_cells);
-        const Real dx          = amr_level.Geom().CellSize(0);
-        const Real cell_volume = dx * dx * dx;
-        const auto &values     = densities->const_arrays();
-        const auto &fields     = state.const_arrays();
-        const auto &masks      = uncovered.const_arrays();
+        const LevelCells cells(a_amr, level, ExhaustDensities::name, a_time,
+                               a_boundary_width, a_min_boundary_cells);
+        const amrex::Box interior = cells.interior;
+        const Real cell_volume    = cells.dx * cells.dx * cells.dx;
+        const auto &values        = cells.derived->const_arrays();
+        const auto &fields = cells.level.get_new_data(state_index).const_arrays();
+        const auto &masks  = cells.uncovered.const_arrays();
 
         const auto result = amrex::ParReduce(
             amrex::TypeList<amrex::ReduceOpSum, amrex::ReduceOpSum,
                             amrex::ReduceOpSum, amrex::ReduceOpSum>{},
-            amrex::TypeList<Real, Real, Real, Real>{}, *densities,
+            amrex::TypeList<Real, Real, Real, Real>{}, *cells.derived,
             amrex::IntVect(0),
             [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy, int iz) noexcept
                 -> amrex::GpuTuple<Real, Real, Real, Real>
@@ -4776,18 +4748,14 @@ void Telemetry::hull(FlightAmr &a_amr, amrex::Real a_time, int a_step,
     Real peak = 0.0;
     for (int level = 0; level <= a_amr.finestLevel(); ++level)
     {
-        amrex::AmrLevel &amr_level = a_amr.getLevel(level);
-        const std::unique_ptr<amrex::MultiFab> fields =
-            amr_level.derive(DeckFields::name, a_time, 0);
-        const amrex::iMultiFab uncovered =
-            uncovered_cells(a_amr, level, *fields);
-        const amrex::Box interior = interior_cells(
-            amr_level.Geom(), a_params.boundary_width, a_min_boundary_cells);
-        const auto &values = fields->const_arrays();
-        const auto &masks  = uncovered.const_arrays();
-        const auto result  = amrex::ParReduce(
+        const LevelCells cells(a_amr, level, DeckFields::name, a_time,
+                               a_params.boundary_width, a_min_boundary_cells);
+        const amrex::Box interior = cells.interior;
+        const auto &values        = cells.derived->const_arrays();
+        const auto &masks         = cells.uncovered.const_arrays();
+        const auto result         = amrex::ParReduce(
             amrex::TypeList<amrex::ReduceOpMax>{}, amrex::TypeList<Real>{},
-            *fields, amrex::IntVect(0),
+            *cells.derived, amrex::IntVect(0),
             [=] AMREX_GPU_DEVICE(int box_no, int ix, int iy,
                                  int iz) noexcept -> amrex::GpuTuple<Real>
             {
@@ -5312,11 +5280,11 @@ void FlightLevel::variableSetUp()
     state_variable_set_up();
     FieldConstraints::set_up(state_index);
     FieldDensities::set_up(state_index);
-    ExhaustDensities::set_up(state_index);
-    HullMotion::set_up(state_index);
+    add_derived<ExhaustDensities>(state_index);
+    add_derived<HullMotion>(state_index);
     Weyl4WithMatter<Field<>>::set_up(state_index);
-    TidalTensor::set_up(state_index);
-    DeckFields::set_up(state_index);
+    add_derived<TidalTensor>(state_index);
+    add_derived<DeckFields>(state_index);
 }
 
 template <class deriv_t>

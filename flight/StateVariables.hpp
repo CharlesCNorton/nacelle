@@ -58,8 +58,7 @@ static const std::array<BCParity, NUM_MATTER_VARS> matter_parities = {
 static const std::array<BCParity, NUM_VARS> parities = ArrayTools::concatenate(
     CCZ4StateVariables::parities, matter_parities);
 
-static const std::array<amrex::Real, NUM_MATTER_VARS> matter_asymptotic_values =
-    {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+static const std::array<amrex::Real, NUM_MATTER_VARS> matter_asymptotic_values{};
 
 static const std::array<amrex::Real, NUM_VARS> asymptotic_values =
     ArrayTools::concatenate(CCZ4StateVariables::asymptotic_values,

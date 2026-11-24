@@ -58,6 +58,7 @@ import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import scipy.fft  # noqa: E402
+import scipy.integrate  # noqa: E402
 import scipy.optimize  # noqa: E402
 import scipy.special  # noqa: E402
 import sympy as sp  # noqa: E402
@@ -802,15 +803,33 @@ REACH = 6.2  # exp(-REACH^2) and erfc(REACH) are below rounding
 
 @dataclasses.dataclass(frozen=True)
 class Region:
-    """An index box of a uniform grid: cells lo to lo + shape - 1 along each axis."""
+    """An index box of a uniform grid: cells lo to lo + shape - 1 along each axis.
+
+    The solver's boxes, the refinement levels' boxes and the boxes of AMReX's
+    files are all regions; AMReX names a box by its first and last cells.
+    """
 
     lo: tuple[int, int, int]
     shape: tuple[int, int, int]
+
+    @staticmethod
+    def corners(lo, last) -> "Region":
+        """The region from the cell `lo` to the cell `last`, both included."""
+        return Region(tuple(lo), tuple(b - a + 1 for a, b in zip(lo, last)))
 
     @property
     def hi(self) -> tuple[int, int, int]:
         """One past the last cell along each axis."""
         return tuple(l + n for l, n in zip(self.lo, self.shape))
+
+    @property
+    def last(self) -> tuple[int, int, int]:
+        """The last cell along each axis."""
+        return tuple(h - 1 for h in self.hi)
+
+    def __str__(self) -> str:
+        """The region as AMReX writes a box."""
+        return "((%s) (%s) (0,0,0))" % (",".join(map(str, self.lo)), ",".join(map(str, self.last)))
 
     @property
     def cells(self) -> int:
@@ -1931,6 +1950,11 @@ def _check_spacetime(curved: bool = False):
 _CHECK_POINTS = ((0.3, 0.1, -0.4, 0.7), (-0.2, 0.9, 0.5, -0.3), (0.6, -0.7, 0.2, 0.4), (0.0, 0.35, -0.8, -0.6))
 
 
+def _label_density(label):
+    """The rest-mass density the checks give the material, as a function of its labels."""
+    return 1.0 + 0.3 * jnp.sin(label[0]) * jnp.cos(0.5 * label[1]) + 0.1 * label[2] ** 2
+
+
 def solid_check(parts: bool = False):
     """How far the solid's 3+1 equation of motion departs from the Euler-Lagrange equation of its Lagrangian.
 
@@ -1941,22 +1965,19 @@ def solid_check(parts: bool = False):
     solid = Solid(shear_speed=0.3, pressure_speed=0.6)
     metric, labels, split = _check_spacetime()
 
-    def label_density(label):
-        return 1.0 + 0.3 * jnp.sin(label[0]) * jnp.cos(0.5 * label[1]) + 0.1 * label[2] ** 2
-
     def flux(x):
         g = metric(x)
         inverse = jnp.linalg.inv(g)
         gradient = jax.jacfwd(labels)(x)
-        slope = jax.grad(solid_energy, argnums=1)(label_density(labels(x)), gradient @ inverse @ gradient.T, solid)
+        slope = jax.grad(solid_energy, argnums=1)(_label_density(labels(x)), gradient @ inverse @ gradient.T, solid)
         return jnp.sqrt(-jnp.linalg.det(g)) * slope @ gradient @ inverse
 
     def terms(x):
         g = metric(x)
         gradient = jax.jacfwd(labels)(x)
         label = labels(x)
-        density = label_density(label)
-        label_slope = jax.grad(lambda at: jnp.log(label_density(at)))(label)
+        density = _label_density(label)
+        label_slope = jax.grad(lambda at: jnp.log(_label_density(at)))(label)
         rho = solid_energy(density, gradient @ jnp.linalg.inv(g) @ gradient.T, solid)
         divergence = jnp.trace(jax.jacfwd(flux)(x), axis1=1, axis2=2) / jnp.sqrt(-jnp.linalg.det(g))
         euler = divergence - 0.5 * label_slope * rho
@@ -1996,9 +2017,7 @@ def solid_force_check() -> float:
     metric, labels, split = _check_spacetime()
 
     def density_of(x):
-        label = labels(x)
-        along_labels = 1.0 + 0.3 * jnp.sin(label[0]) * jnp.cos(0.5 * label[1]) + 0.1 * label[2] ** 2
-        return along_labels * (1.0 + 0.2 * jnp.sin(0.7 * x[0] + 0.3 * x[1]))
+        return _label_density(labels(x)) * (1.0 + 0.2 * jnp.sin(0.7 * x[0] + 0.3 * x[1]))
 
     def stress_energy(x):
         """T^(mu nu) of the solid."""
@@ -2834,6 +2853,12 @@ def least_mass(
 # --- the solver against closed forms ----------------------------------------
 
 
+def small_ring(amplitude: float = 0.05) -> Design:
+    """A ring carrying a scalar field at rest on a domain of side 16, which the checks of the solver solve."""
+    ring = Ring(center=(0.0, 0.0, 0.0), axis=(0.0, 0.0, 1.0), radius=2.0, width=0.75)
+    return Design(parts=(Part(shape=ring, amplitude=amplitude),), domain=Domain(extent=16.0))
+
+
 def selftest(memory: Memory | None = None) -> list[tuple[str, float, float]]:
     """Check the solver against closed forms; each row is a check, its largest relative error and the error allowed.
 
@@ -2918,16 +2943,15 @@ def selftest(memory: Memory | None = None) -> list[tuple[str, float, float]]:
     window = (slice(None),) + read.window(coarse_cells)
     check("blurred curvature on the two grids", on_coarse[window][:6], again[:6], 1e-11)
 
-    # the implicit derivative, on a small ring
+    # the solve of a small ring, and its mass and the mass's implicit derivative
 
     grid = FineGrid(region=Region((0, 0, 0), (24, 24, 24)), h=16.0 / 24, origin=-8.0)
     kernel = grid.kernel()
-
-    def ring_mass(amplitude):
-        ring = Ring(center=(0.0, 0.0, 0.0), axis=(0.0, 0.0, 1.0), radius=2.0, width=0.75)
-        return design_mass(Design(parts=(Part(shape=ring, amplitude=amplitude),), domain=Domain(extent=16.0)), grid, kernel)
-
-    value_and_slope = jax.jit(jax.value_and_grad(ring_mass))
+    solution = solve_design(small_ring(), grid, memory=memory)
+    rows.append(("residual of the constraint solve", solution.residual, 1e-13))
+    rows.append(("source at the edge of the solver's box", solution.edge_source, 1e-12))
+    value_and_slope = jax.jit(jax.value_and_grad(lambda amplitude: design_mass(small_ring(amplitude), grid, kernel)))
+    rows.append(("differentiable mass against the solve's", abs(float(value_and_slope(0.05)[0]) / solution.adm_mass - 1.0), 1e-12))
     step = 1e-5
     finite = (float(value_and_slope(0.05 + step)[0]) - float(value_and_slope(0.05 - step)[0])) / (2.0 * step)
     rows.append(("implicit derivative of the mass", abs(float(value_and_slope(0.05)[1]) / finite - 1.0), 1e-6))
@@ -3062,33 +3086,6 @@ def conformally_flat(psi, lapse=None) -> dict[str, np.ndarray]:
 
 
 @dataclasses.dataclass(frozen=True)
-class Box:
-    """An index box with inclusive corners, in the index space of its level."""
-
-    lo: tuple[int, int, int]
-    hi: tuple[int, int, int]
-
-    @property
-    def shape(self) -> tuple[int, int, int]:
-        return tuple(h - l + 1 for l, h in zip(self.lo, self.hi))
-
-    @property
-    def cells(self) -> int:
-        return math.prod(self.shape)
-
-    def grow(self, n: int) -> "Box":
-        return Box(tuple(l - n for l in self.lo), tuple(h + n for h in self.hi))
-
-    def coarsen(self, ratio: int = 2) -> "Box":
-        return Box(tuple(l // ratio for l in self.lo), tuple(h // ratio for h in self.hi))
-
-    def __str__(self) -> str:
-        lo = ",".join(str(v) for v in self.lo)
-        hi = ",".join(str(v) for v in self.hi)
-        return f"(({lo}) ({hi}) (0,0,0))"
-
-
-@dataclasses.dataclass(frozen=True)
 class Hierarchy:
     """A cubic domain of n_cell^3 level-0 cells and the boxes of every level."""
 
@@ -3097,7 +3094,7 @@ class Hierarchy:
     num_ghosts: int
     blocking_factor: int
     max_grid_size: int
-    levels: tuple[tuple[Box, ...], ...]
+    levels: tuple[tuple[Region, ...], ...]
 
     @property
     def max_level(self) -> int:
@@ -3243,14 +3240,7 @@ def place_levels(
                 )
 
     base = [
-        Box(
-            (i, j, k),
-            (
-                min(i + max_grid_size, n_cell) - 1,
-                min(j + max_grid_size, n_cell) - 1,
-                min(k + max_grid_size, n_cell) - 1,
-            ),
-        )
+        Region((i, j, k), tuple(min(v + max_grid_size, n_cell) - v for v in (i, j, k)))
         for k in range(0, n_cell, max_grid_size)
         for j in range(0, n_cell, max_grid_size)
         for i in range(0, n_cell, max_grid_size)
@@ -3258,7 +3248,7 @@ def place_levels(
     levels = [tuple(base)]
     for level in range(1, max_level + 1):
         boxes = [
-            Box(tuple(v * blocking_factor for v in lo), tuple((v + 1) * blocking_factor - 1 for v in hi))
+            Region.corners(tuple(v * blocking_factor for v in lo), tuple((v + 1) * blocking_factor - 1 for v in hi))
             for lo, hi in _merge_blocks(tagged[level], max_blocks)
         ]
         levels.append(tuple(boxes))
@@ -3298,10 +3288,10 @@ def _real(value: float) -> str:
 def write_multifab(
     directory: str | Path,
     name: str,
-    boxes: Sequence[Box],
+    boxes: Sequence[Region],
     ngrow: int,
     ncomp: int,
-    data_for_box: Callable[[int, Box], np.ndarray],
+    data_for_box: Callable[[int, Region], np.ndarray],
     bytes_per_file: int = 1 << 30,
 ) -> None:
     """Write a MultiFab whose box i holds data_for_box(i, box) on the box grown by ngrow cells."""
@@ -3347,7 +3337,13 @@ def write_multifab(
     (directory / f"{name}_H").write_text("\n".join(lines) + "\n", newline="\n")
 
 
-def read_multifab(directory: str | Path, name: str) -> tuple[int, list[tuple[Box, np.ndarray]]]:
+def _parse_box(match) -> Region:
+    """The region of a box AMReX wrote, from a match of _BOX."""
+    numbers = [int(v) for v in match.groups()]
+    return Region.corners(numbers[0:3], numbers[3:6])
+
+
+def read_multifab(directory: str | Path, name: str) -> tuple[int, list[tuple[Region, np.ndarray]]]:
     """Read a MultiFab; returns its ghost width and, for each box, the valid box and the stored values."""
     directory = Path(directory)
     header = (directory / f"{name}_H").read_text().split("\n")
@@ -3357,11 +3353,7 @@ def read_multifab(directory: str | Path, name: str) -> tuple[int, list[tuple[Box
     ngrow_text = header[3].strip()
     ngrow = int(ngrow_text) if not ngrow_text.startswith("(") else max(int(v) for v in ngrow_text.strip("()").split(","))
     count = int(header[4].strip("(").split()[0])
-    boxes = []
-    for line in header[5 : 5 + count]:
-        match = _BOX.fullmatch(line.strip())
-        lo, hi = tuple(int(v) for v in match.groups()[0:3]), tuple(int(v) for v in match.groups()[3:6])
-        boxes.append(Box(lo, hi))
+    boxes = [_parse_box(_BOX.fullmatch(line.strip())) for line in header[5 : 5 + count]]
     cursor = 5 + count + 1
     if int(header[cursor]) != count:
         raise ValueError(f"{directory / name}_H: box and FabOnDisk counts differ")
@@ -3371,8 +3363,7 @@ def read_multifab(directory: str | Path, name: str) -> tuple[int, list[tuple[Box
         with open(directory / file_name, "rb") as stream:
             stream.seek(int(offset))
             fab_header = stream.readline().decode("ascii")
-            match = _BOX.search(fab_header)
-            stored = Box(tuple(int(v) for v in match.groups()[0:3]), tuple(int(v) for v in match.groups()[3:6]))
+            stored = _parse_box(_BOX.search(fab_header))
             fab_ncomp = int(fab_header.rsplit(" ", 1)[1])
             if fab_ncomp != ncomp or stored != box.grow(ngrow):
                 raise ValueError(f"{directory / file_name}: FAB header {fab_header.strip()} does not match {name}_H")
@@ -3654,7 +3645,7 @@ def level_fields(design, hierarchy: Hierarchy, solution, level: int, region: Reg
     return fields
 
 
-def box_fields(fields: dict[str, np.ndarray], region: Region, box: Box, ghosts: int) -> dict[str, np.ndarray]:
+def box_fields(fields: dict[str, np.ndarray], region: Region, box: Region, ghosts: int) -> dict[str, np.ndarray]:
     """The state variables on a box and its ghost cells, from the fields of `level_fields` on `region`.
 
     The extrinsic curvature is psi^-2 times the conformal one and trace-free,
@@ -3667,8 +3658,7 @@ def box_fields(fields: dict[str, np.ndarray], region: Region, box: Box, ghosts: 
     moving hull are those of the frame the flight evolves them in, so d is
     zero, and their rate is psi^-2 times the rate in flat space.
     """
-    grown = Region(tuple(lo - ghosts for lo in box.lo), tuple(n + 2 * ghosts for n in box.shape))
-    window = region.window(grown)
+    window = region.window(box.grow(ghosts))
     psi = fields["psi"][window]
     out = conformally_flat(psi, psi**-2)
     out["phi"] = fields["phi"][window]
@@ -3718,7 +3708,7 @@ def outside_domain(fine: FineGrid, extent: float):
     return np.asarray((jnp.abs(x) > limit) | (jnp.abs(y) > limit) | (jnp.abs(z) > limit))
 
 
-def tiles(boxes: Sequence[Box], ghosts: int, side: int) -> list[tuple[Region, list[int]]]:
+def tiles(boxes: Sequence[Region], ghosts: int, side: int) -> list[tuple[Region, list[int]]]:
     """Group a level's boxes into blocks of about `side` cells; each comes with the region its boxes and ghosts span."""
     groups: dict[tuple[int, int, int], list[int]] = {}
     for index, box in enumerate(boxes):
@@ -3727,7 +3717,7 @@ def tiles(boxes: Sequence[Box], ghosts: int, side: int) -> list[tuple[Region, li
     for key in sorted(groups):
         members = groups[key]
         lo = tuple(min(boxes[i].lo[axis] for i in members) - ghosts for axis in range(3))
-        hi = tuple(max(boxes[i].hi[axis] for i in members) + 1 + ghosts for axis in range(3))
+        hi = tuple(max(boxes[i].hi[axis] for i in members) + ghosts for axis in range(3))
         out.append((Region(lo, tuple(h - l for l, h in zip(lo, hi))), members))
     return out
 
@@ -3903,83 +3893,49 @@ def build(
 # `nacelle fly`: run the flight app on a run directory, and read what a flight reports.
 
 
-CONSTRAINT_COLUMNS = ("step", "time", "ham_l2", "ham_linf", "mom_l2", "mom_linf")
-DIAGNOSTIC_COLUMNS = (
-    "step", "time", "energy", "px", "py", "pz", "cx", "cy", "cz", "lapse_min", "shift_max", "sx", "sy", "sz"
-)  # fmt: skip
-KERNEL_COLUMNS = ("step", "time", "double", "single")
-EXHAUST_COLUMNS = ("step", "time", "energy", "px", "py", "pz")
-HULL_COLUMNS = ("step", "time", "strain", "margin", "vx", "vy", "vz", "ax", "ay", "az")
-CABIN_COLUMNS = ("step", "time", "point", "x", "y", "z", "ax", "ay", "az", "felt", "tidal1", "tidal2", "tidal3")
-WAVE_COLUMNS = ("step", "time", "power", "fx", "fy", "fz", "energy", "px", "py", "pz")
+# What a flight reports, a table per file telemetry/NAME.dat with a row per report, by the columns of each:
+#   constraints  the constraint norms
+#   diagnostics  the matter's energy, momentum, centre and extent and the gauge's extremes
+#   exhaust      the exhaust's energy and momentum; the hull's are the matter's less these
+#   hull         the hull's largest equivalent strain, its margin to the yield strain, NaN without one, and its mean
+#                velocity and that velocity's rate of change, NaN at the first report
+#   cabin        a row per cabin point: its position, the acceleration a passenger at rest there feels and its
+#                magnitude, NaN at the first report, and the eigenvalues of the tidal tensor there, lowest first, minus
+#                each the relative acceleration of free particles per unit of their separation along its direction
+#   waves        the power and the momentum per unit time that gravitational waves carry out, and their integrals
+#   kernel       how far the fused kernel in double and in single precision departed from the reference, each the
+#                largest difference of a right-hand side from the reference one as a fraction of the largest
+#                reference value, written by a flight given kernel.check=N
+TELEMETRY = {
+    "constraints": ("step", "time", "ham_l2", "ham_linf", "mom_l2", "mom_linf"),
+    "diagnostics": (
+        "step", "time", "energy", "px", "py", "pz", "cx", "cy", "cz", "lapse_min", "shift_max", "sx", "sy", "sz"
+    ),
+    "exhaust": ("step", "time", "energy", "px", "py", "pz"),
+    "hull": ("step", "time", "strain", "margin", "vx", "vy", "vz", "ax", "ay", "az"),
+    "cabin": ("step", "time", "point", "x", "y", "z", "ax", "ay", "az", "felt", "tidal1", "tidal2", "tidal3"),
+    "waves": ("step", "time", "power", "fx", "fy", "fz", "energy", "px", "py", "pz"),
+    "kernel": ("step", "time", "double", "single"),
+}  # fmt: skip
+NORMS = TELEMETRY["constraints"][2:]
 KERNELS = ("reference", "double", "single")
 
 
-def _read_table(path: Path, expected: tuple[str, ...]) -> dict[str, np.ndarray]:
+def read_telemetry(run_dir: str | Path, name: str) -> dict[str, np.ndarray]:
+    """The telemetry table `name` of a run, one array per column of TELEMETRY[name]."""
+    path = Path(run_dir) / "telemetry" / f"{name}.dat"
     text = path.read_text()
-    header = text.split("\n", 1)[0]
-    columns = tuple(header.lstrip("# ").split())
-    if columns != expected:
-        raise ValueError(f"{path}: columns {columns} are not {expected}")
+    columns = tuple(text.split("\n", 1)[0].lstrip("# ").split())
+    if columns != TELEMETRY[name]:
+        raise ValueError(f"{path}: columns {columns} are not {TELEMETRY[name]}")
     # a row the flight app is still writing is left for the next read
     rows = [line.split() for line in text[: text.rfind("\n") + 1].splitlines()[1:] if line.strip()]
     table = np.array([[float(value) for value in row] for row in rows], dtype=float).reshape(len(rows), len(columns))
-    out = {name: table[:, index] for index, name in enumerate(columns)}
-    out["step"] = out["step"].astype(int)
+    out = {column: table[:, index] for index, column in enumerate(columns)}
+    for column in ("step", "point"):
+        if column in out:
+            out[column] = out[column].astype(int)
     return out
-
-
-def read_constraints(run_dir: str | Path) -> dict[str, np.ndarray]:
-    """The constraint norms of a run, one array per column of telemetry/constraints.dat."""
-    return _read_table(Path(run_dir) / "telemetry" / "constraints.dat", CONSTRAINT_COLUMNS)
-
-
-def read_exhaust(run_dir: str | Path) -> dict[str, np.ndarray]:
-    """The exhaust's energy and momentum, from telemetry/exhaust.dat; the hull's are the matter's less these."""
-    return _read_table(Path(run_dir) / "telemetry" / "exhaust.dat", EXHAUST_COLUMNS)
-
-
-def read_diagnostics(run_dir: str | Path) -> dict[str, np.ndarray]:
-    """The matter's energy, momentum, centre and extent and the gauge's extremes, from telemetry/diagnostics.dat."""
-    return _read_table(Path(run_dir) / "telemetry" / "diagnostics.dat", DIAGNOSTIC_COLUMNS)
-
-
-def read_kernel_check(run_dir: str | Path) -> dict[str, np.ndarray]:
-    """How far the fused kernel in double and in single precision departed from the reference, from telemetry/kernel.dat.
-
-    Each value is the largest difference of a right-hand side from the
-    reference one, as a fraction of the largest reference value. The file is
-    written by a flight given `kernel.check=N`.
-    """
-    return _read_table(Path(run_dir) / "telemetry" / "kernel.dat", KERNEL_COLUMNS)
-
-
-def read_hull(run_dir: str | Path) -> dict[str, np.ndarray]:
-    """The hull's largest equivalent strain, its margin to the yield strain, its mean velocity and that velocity's rate of change.
-
-    From telemetry/hull.dat. The margin is NaN without a yield strain, and the
-    rate of change at the first report.
-    """
-    return _read_table(Path(run_dir) / "telemetry" / "hull.dat", HULL_COLUMNS)
-
-
-def read_cabin(run_dir: str | Path) -> dict[str, np.ndarray]:
-    """A row per cabin point per report, from telemetry/cabin.dat.
-
-    Each holds the point's position, the acceleration a passenger at rest
-    there feels and its magnitude, NaN at the first report, and the
-    eigenvalues of the tidal tensor there, lowest first: minus each is the
-    relative acceleration of free particles per unit of their separation
-    along its direction.
-    """
-    table = _read_table(Path(run_dir) / "telemetry" / "cabin.dat", CABIN_COLUMNS)
-    table["point"] = table["point"].astype(int)
-    return table
-
-
-def read_waves(run_dir: str | Path) -> dict[str, np.ndarray]:
-    """The power and the momentum per unit time that gravitational waves carry out, and their integrals, from telemetry/waves.dat."""
-    return _read_table(Path(run_dir) / "telemetry" / "waves.dat", WAVE_COLUMNS)
 
 
 def read_deck(run_dir: str | Path) -> dict:
@@ -4003,16 +3959,6 @@ def read_frame(run_dir: str | Path, frame: int | dict = -1) -> dict[str, np.ndar
     }
 
 
-TELEMETRY_TABLES = {
-    "constraints": CONSTRAINT_COLUMNS,
-    "diagnostics": DIAGNOSTIC_COLUMNS,
-    "exhaust": EXHAUST_COLUMNS,
-    "hull": HULL_COLUMNS,
-    "cabin": CABIN_COLUMNS,
-    "waves": WAVE_COLUMNS,
-}
-
-
 def _plain(value):
     """A value with every float that is not finite replaced by None, as JSON can carry it."""
     if isinstance(value, float):
@@ -4025,14 +3971,11 @@ def _plain(value):
 
 
 def telemetry_tables(run_dir: str | Path) -> dict:
-    """Every telemetry file of a run as lists of columns, a file the flight app has just started left out."""
+    """Every telemetry table of a run as lists of columns, a file the flight app has just started left out."""
     out = {}
-    for name, columns in TELEMETRY_TABLES.items():
-        path = Path(run_dir) / "telemetry" / f"{name}.dat"
-        if not path.is_file():
-            continue
+    for name in TELEMETRY:
         try:
-            table = _read_table(path, columns)
+            table = read_telemetry(run_dir, name)
         except (OSError, ValueError):
             continue
         out[name] = {key: _plain(values.astype(float).tolist()) for key, values in table.items()}
@@ -4250,10 +4193,10 @@ def fly(
         "wall_seconds": wall_seconds,
     }
     if (run_dir / "telemetry" / "constraints.dat").is_file():
-        constraints = read_constraints(run_dir)
+        constraints = read_telemetry(run_dir, "constraints")
         record["steps"] = int(constraints["step"][-1])
         record["time"] = float(constraints["time"][-1])
-        for name in ("ham_l2", "ham_linf", "mom_l2", "mom_linf"):
+        for name in NORMS:
             record[name] = {
                 "initial": float(constraints[name][0]),
                 "final": float(constraints[name][-1]),
@@ -4261,9 +4204,6 @@ def fly(
             }
     (run_dir / "flight.json").write_text(json.dumps(record, indent=2) + "\n", newline="\n")
     return record
-
-
-NORMS = ("ham_l2", "ham_linf", "mom_l2", "mom_linf")
 
 
 def study(
@@ -4298,7 +4238,7 @@ def study(
         record = fly(run, stop_time=stop_time, **flight)
         if record["exit_code"] != 0:
             raise RuntimeError(f"the flight in {run} ended with exit code {record['exit_code']}; see its flight.log")
-        constraints = read_constraints(run)
+        constraints = read_telemetry(run, "constraints")
         rows.append(
             {
                 "n_cell": n_cell,
@@ -5002,12 +4942,17 @@ def family_tensor(name, vals, modules="numpy"):
 # T_ab is symmetric and given on an orthonormal frame whose index 0 is
 # timelike.
 
+def tensor_size(T):
+    """The largest magnitude of a component of T at each point, the scale its margins are relative to."""
+    return np.maximum(np.abs(T).max(axis=(-1, -2)), 1e-300)
+
+
 def nec_dual(T, iters=36):
     """The minimum of T(k,k) over null k = (1, n), as 2 max_mu lambda_min(T + mu eta), and the maximiser mu.
 
     lambda_min(T + mu eta) is concave in mu with slope v.eta.v for its unit eigenvector v, so the maximiser is
     bracketed by bisection on the sign of that slope."""
-    scale = np.maximum(np.abs(T).max(axis=(-1, -2)), 1e-300)
+    scale = tensor_size(T)
     lo, hi = -4 * scale, 4 * scale
     for _ in range(iters):
         mu = (lo + hi) / 2
@@ -5019,26 +4964,30 @@ def nec_dual(T, iters=36):
     return 2 * np.linalg.eigvalsh(T + mu[..., None, None] * ETA)[..., 0], mu
 
 
-def type_one(T, tol=1e-9):
-    """Rest-frame density and principal pressures where T is Hawking-Ellis type I, with a validity mask."""
+def _eigenframe(T, tol):
+    """The eigenvalues of T^a_b at each point, its eigenvectors [point, eigenvector, component] with their norms, the
+    eigenvector nearest the timelike, and whether T is of Hawking-Ellis type I there: real eigenvalues, one timelike
+    eigenvector and three spacelike ones."""
     M = T.copy()
     M[..., 0, :] *= -1.0
     w, V = np.linalg.eig(M)
-    w = np.asarray(w, dtype=complex)
-    V = np.asarray(V, dtype=complex)
-    scale = np.maximum(np.abs(T).max(axis=(-1, -2)), 1e-300)
-    real = np.abs(w.imag).max(axis=-1) <= tol * scale
-    Vr = V.real
-    norm = -Vr[..., 0, :] ** 2 + (Vr[..., 1:, :] ** 2).sum(axis=-2)
-    size = (Vr ** 2).sum(axis=-2)
-    rel = norm / np.maximum(size, 1e-300)
+    w, V = np.asarray(w, dtype=complex), np.asarray(V, dtype=complex)
+    real = np.abs(w.imag).max(axis=-1) <= tol * tensor_size(T)
+    vectors = np.swapaxes(V.real, -1, -2)
+    norm = -vectors[..., 0] ** 2 + (vectors[..., 1:] ** 2).sum(-1)
+    rel = norm / np.maximum((vectors**2).sum(-1), 1e-300)
     it = np.argmin(rel, axis=-1)
     timelike = np.take_along_axis(rel, it[..., None], axis=-1)[..., 0] < -tol
     others = np.sort(np.where(np.arange(4) == it[..., None], np.inf, rel), axis=-1)[..., 0] > tol
-    rho = -np.take_along_axis(w.real, it[..., None], axis=-1)[..., 0]
-    mask = np.arange(4) != it[..., None]
-    p = np.sort(np.where(mask, w.real, np.nan), axis=-1)[..., :3]
-    return rho, p, real & timelike & others
+    return w.real, vectors, norm, it, real & timelike & others
+
+
+def type_one(T, tol=1e-9):
+    """Rest-frame density and principal pressures where T is Hawking-Ellis type I, with a validity mask."""
+    w, _, _, it, ok = _eigenframe(T, tol)
+    rho = -np.take_along_axis(w, it[..., None], axis=-1)[..., 0]
+    p = np.sort(np.where(np.arange(4) != it[..., None], w, np.nan), axis=-1)[..., :3]
+    return rho, p, ok
 
 
 def margins(T):
@@ -5059,7 +5008,7 @@ def margins(T):
 def worst_margins(T):
     """The smallest margin of each condition over a batch, relative to the local size of T."""
     mg = margins(T)
-    scale = np.maximum(np.abs(T).max(axis=(-1, -2)), 1e-300)
+    scale = tensor_size(T)
     return {k: float((mg[k] / scale).min()) for k in CONDITIONS}
 
 
@@ -5091,9 +5040,8 @@ def condition_matrices(which=CONDITIONS, n1=96, n2=36, n3=96, speeds=(0.0, 0.3, 
         for v in speeds:
             mats.extend(np.outer(vec(n, v), vec(n, v)) for n in d3)
     if "sec" in which:
-        inv = np.diag([-1.0, 1.0, 1.0, 1.0])
         for v in speeds:
-            mats.extend(np.outer(vec(n, v), vec(n, v)) + 0.5 * (1 - v * v) * inv for n in d3)
+            mats.extend(np.outer(vec(n, v), vec(n, v)) + 0.5 * (1 - v * v) * ETA for n in d3)
     mats = np.array(mats)
     return mats / np.sqrt((mats ** 2).sum(axis=(1, 2)))[:, None, None]
 
@@ -5143,22 +5091,6 @@ def bern_eval(coef, t, order=0, xp=np):
     return fac * out
 
 
-class Step:
-    """A function equal to `left` below ra, `right` above rb, and a polynomial step between."""
-
-    def __init__(self, ra, rb, left, right, a=3, b=3):
-        self.ra, self.rb, self.left, self.right = ra, rb, left, right
-        self.coef = beta_step(a, b)
-
-    def __call__(self, r, order=0, xp=np):
-        w = self.rb - self.ra
-        t = xp.clip((r - self.ra) / w, 0.0, 1.0)
-        v = poly_eval(self.coef, t, order, xp) * (self.right - self.left) / w ** order
-        if order == 0:
-            return self.left + v
-        return xp.where((r > self.ra) & (r < self.rb), v, 0.0)
-
-
 class Bern:
     """A Bernstein polynomial in (r - ra)/(rb - ra) on [ra, rb], continued by its end values."""
 
@@ -5181,37 +5113,8 @@ def basis_matrix(n, ra, rb, r, order=0):
 
 
 class Conformal:
-    """psi with -2 r^2 psi' = q(r), q a polynomial step from 0 to M across [R1, R2]; psi = 1 + M/(2r) outside."""
-
-    def __init__(self, R1, R2, M, a=3, b=3):
-        self.R1, self.R2, self.M = R1, R2, M
-        self.q = Step(R1, R2, 0.0, M, a, b)
-        w = R2 - R1
-        cx = self.q.coef * M / w ** np.arange(len(self.q.coef))
-        quo, rem = np.polynomial.polynomial.polydiv(cx, np.array([R1 ** 2, 2 * R1, 1.0]))
-        rem = np.concatenate([rem, np.zeros(2)])[:2]
-        self.alpha = rem[1]
-        self.beta = rem[0] - rem[1] * R1
-        self.prim = np.polynomial.polynomial.polyint(quo)
-        self.at_R2 = 1.0 + M / (2 * R2)
-        self.F_R2 = self._F(np.asarray(R2))
-
-    def _F(self, r, xp=np):
-        return poly_eval(self.prim, r - self.R1, 0, xp) + self.alpha * xp.log(r) - self.beta / r
-
-    def __call__(self, r, order=0, xp=np):
-        q0 = self.q(r, 0, xp)
-        if order == 1:
-            return -q0 / (2 * r ** 2)
-        if order == 2:
-            return -self.q(r, 1, xp) / (2 * r ** 2) + q0 / r ** 3
-        rc = xp.clip(r, self.R1, self.R2)
-        wall = self.at_R2 + (self.F_R2 - self._F(rc, xp)) / 2
-        return xp.where(r >= self.R2, 1.0 + self.M / (2 * r), wall)
-
-
-class ConformalQ:
-    """psi with -2 r^2 psi' = q(r) for any profile q rising from 0 at R1 to M at R2, by Gauss-Legendre quadrature."""
+    """psi with -2 r^2 psi' = q(r) for a profile q rising from 0 at R1 to M at R2, by Gauss-Legendre quadrature, and
+    psi = 1 + M/(2r) outside."""
 
     def __init__(self, R1, R2, M, q):
         self.R1, self.R2, self.M, self.q = R1, R2, M, q
@@ -5241,6 +5144,14 @@ def wall_grid(R1, R2, nr=241, nc=33, polar=False):
     return np.meshgrid(wall_radii(R1, R2, nr), c, indexing="ij")
 
 
+def _bisect(ok, lo, hi, iters):
+    """The largest s with ok(s) between lo, where ok holds, and hi, where it does not, the bracket halved iters times."""
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
+    return lo
+
+
 def largest_amplitude(ok, start=1.0, iters=30):
     """The largest amplitude s with ok(s), searched from `start`; None when no amplitude up to `start` is feasible."""
     if ok(start):
@@ -5248,14 +5159,32 @@ def largest_amplitude(ok, start=1.0, iters=30):
         while ok(hi) and hi < 64 * start:
             lo, hi = hi, 2 * hi
     else:
-        steps = [x for x in np.linspace(0.0, start, 41)[::-1] if ok(x)]
-        if not steps or steps[0] <= 0:
+        lo = next((x for x in np.linspace(0.0, start, 41)[::-1] if ok(x)), 0.0)
+        if lo <= 0:
             return None
-        lo, hi = steps[0], steps[0] + start / 40
-    for _ in range(iters):
-        mid = (lo + hi) / 2
-        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
-    return lo
+        hi = lo + start / 40
+    return _bisect(ok, lo, hi, iters)
+
+
+def bisect_max(ok, hi=1.0, iters=40):
+    """The largest x with ok(x), for a predicate true at 0 and false beyond a threshold."""
+    if not ok(0.0):
+        return float("nan")
+    lo = 0.0
+    while ok(hi):
+        lo, hi = hi, 2 * hi
+        if hi > 1e6:
+            return float("inf")
+    return _bisect(ok, lo, hi, iters)
+
+
+def exact_scale(ok, safety=0.98, iters=30):
+    """1 when ok(1); otherwise a safety factor times the largest s in [0, 1] with ok(s)."""
+    if ok(1.0):
+        return 1.0
+    if not ok(0.0):
+        return float("nan")
+    return safety * _bisect(ok, 0.0, 1.0, iters)
 
 
 def drift_finalize(d, which, start=1.0, safety=0.98):
@@ -5276,61 +5205,48 @@ def drift_finalize(d, which, start=1.0, safety=0.98):
     return s, rep
 
 
-def bisect_max(ok, hi=1.0, iters=40):
-    """The largest x with ok(x), for a predicate true at 0 and false beyond a threshold."""
-    if not ok(0.0):
-        return float("nan")
-    lo = 0.0
-    while ok(hi):
-        lo, hi = hi, 2 * hi
-        if hi > 1e6:
-            return float("inf")
-    for _ in range(iters):
-        mid = (lo + hi) / 2
-        if ok(mid):
-            lo = mid
-        else:
-            hi = mid
-    return lo
-
-
 # --- drag designs ------------------------------------------------------------
+
+def radial_values(r, c, jets):
+    """The arguments of a family's closed forms at radii r and cosines c of the angle, from jets(radii), those other
+    than c and s at the distinct radii, which are evaluated once a radius."""
+    r, c = np.broadcast_arrays(np.asarray(r, dtype=float), np.asarray(c, dtype=float))
+    ru, inv = np.unique(r, return_inverse=True)
+    inv = inv.reshape(r.shape)
+    out = {k: np.broadcast_to(np.asarray(v, dtype=float), ru.shape)[inv] for k, v in jets(ru).items()}
+    out.update(c=c, s=np.sqrt(np.maximum(1 - c * c, 0.0)))
+    return out
+
+
+def lapse_jets(p0, p1, p2, g0, g1, g2, xp=np):
+    """The drag family's lapse N = (2 - psi)/psi * exp(g) and its first two derivatives, from those of psi and g."""
+    l1 = -p1 / (2 - p0) - p1 / p0 + g1
+    l2 = -p2 / (2 - p0) - p1 ** 2 / (2 - p0) ** 2 - p2 / p0 + p1 ** 2 / p0 ** 2 + g2
+    N = (2 - p0) / p0 * xp.exp(g0)
+    return N, N * l1, N * (l2 + l1 ** 2)
+
 
 class DragDesign:
     """A member of the drag family: conformal factor psi, lapse N = (2 - psi)/psi * exp(g), shift profiles f and h."""
 
-    def __init__(self, R1, R2, M, f, h, psi=None, g=None):
+    def __init__(self, R1, R2, M, f, h, psi, g):
         self.R1, self.R2, self.M = R1, R2, M
-        self.psi = psi if psi is not None else Conformal(R1, R2, M)
-        self.f, self.h, self.g = f, h, g
+        self.psi, self.f, self.h, self.g = psi, f, h, g
 
     def lapse_jet(self, r, xp=np):
         """Lapse and its first two derivatives."""
-        p0, p1, p2 = (self.psi(r, k, xp) for k in range(3))
-        l1 = -p1 / (2 - p0) - p1 / p0
-        l2 = -p2 / (2 - p0) - p1 ** 2 / (2 - p0) ** 2 - p2 / p0 + p1 ** 2 / p0 ** 2
-        N = (2 - p0) / p0
-        if self.g is not None:
-            N = N * xp.exp(self.g(r, 0, xp))
-            l1 = l1 + self.g(r, 1, xp)
-            l2 = l2 + self.g(r, 2, xp)
-        return N, N * l1, N * (l2 + l1 ** 2)
+        return lapse_jets(*(self.psi(r, k, xp) for k in range(3)), *(self.g(r, k, xp) for k in range(3)), xp)
 
     def values(self, r, c, b, b_t=0.0):
         """All arguments of the closed forms at radius r and c = cos(theta)."""
-        r, c = np.broadcast_arrays(np.asarray(r, dtype=float), np.asarray(c, dtype=float))
-        ru, inv = np.unique(r, return_inverse=True)
-        inv = inv.reshape(r.shape)
 
-        def spread(v):
-            return np.broadcast_to(np.asarray(v, dtype=float), ru.shape)[inv]
+        def jets(ru):
+            out = dict(zip(("N", "N_r", "N_rr"), self.lapse_jet(ru)), r=ru, b=b, b_t=b_t)
+            for name, fn in (("psi", self.psi), ("f", self.f), ("h", self.h)):
+                out.update(zip((name, name + "_r", name + "_rr"), (fn(ru, k) for k in range(3))))
+            return out
 
-        N, N_r, N_rr = (spread(v) for v in self.lapse_jet(ru))
-        out = {"r": r, "c": c, "s": np.sqrt(np.maximum(1 - c * c, 0.0)), "N": N, "N_r": N_r, "N_rr": N_rr,
-               "b": np.zeros_like(r) + b, "b_t": np.zeros_like(r) + b_t}
-        for name, fn in (("psi", self.psi), ("f", self.f), ("h", self.h)):
-            out[name], out[name + "_r"], out[name + "_rr"] = (spread(fn(ru, k)) for k in range(3))
-        return out
+        return radial_values(r, c, jets)
 
     def tensor(self, r, c, b=1.0, b_t=0.0):
         """T_ab on the Eulerian frame."""
@@ -5382,32 +5298,19 @@ class DragDesign:
         R1, R2, M = d["R1"], d["R2"], d["M"]
         co = {k: np.asarray(d[k], dtype=float) for k in "fhgq"}
         return DragDesign(R1, R2, M, Bern(d["ra"], d["rb"], co["f"]), Bern(d["ra"], d["rb"], co["h"]),
-                          psi=ConformalQ(R1, R2, M, Bern(R1, R2, co["q"])), g=Bern(R1, R2, co["g"]))
-
-    def bmax(self, cond=CONDITIONS, tol=1e-9, grid=None):
-        """The largest shift amplitude for which the named conditions hold over the wall."""
-        grid = grid if grid is not None else wall_grid(self.R1, self.R2)
-
-        def ok(b):
-            if not self.timelike(b):
-                return False
-            w = self.worst(b, 0.0, grid)
-            return all(w[k] >= -tol for k in cond)
-
-        return bisect_max(ok, hi=1e-3)
+                          psi=Conformal(R1, R2, M, Bern(R1, R2, co["q"])), g=Bern(R1, R2, co["g"]))
 
 
 # --- sequential linear programming on sampled energy conditions --------------
 
 def linprog(*args, **kw):
     """scipy's linprog, waiting and trying again when the solver cannot allocate memory."""
-    from scipy.optimize import linprog as solve
     for _ in range(40):
         try:
-            return solve(*args, **kw)
+            return scipy.optimize.linprog(*args, **kw)
         except MemoryError:
             time.sleep(30)
-    return solve(*args, **kw)
+    return scipy.optimize.linprog(*args, **kw)
 
 
 def principal_observers(T, which, tol=1e-9):
@@ -5419,18 +5322,7 @@ def principal_observers(T, which, tol=1e-9):
     T(u + e_i, u - e_i). A margin is the least value of a condition over observers, and by Danskin's theorem its
     derivative is the derivative at the observer that binds it, so the matrices are held fixed while T changes.
     """
-    M = T.copy()
-    M[..., 0, :] *= -1.0
-    w, V = np.linalg.eig(M)
-    w, V = np.asarray(w, dtype=complex), np.asarray(V, dtype=complex)
-    scale = np.maximum(np.abs(T).max(axis=(-1, -2)), 1e-300)
-    real = np.abs(w.imag).max(axis=-1) <= tol * scale
-    vectors = np.swapaxes(V.real, -1, -2)  # [point, eigenvector, component]
-    norm = -vectors[..., 0] ** 2 + (vectors[..., 1:] ** 2).sum(-1)
-    rel = norm / np.maximum((vectors**2).sum(-1), 1e-300)
-    it = np.argmin(rel, axis=-1)
-    timelike = np.take_along_axis(rel, it[..., None], axis=-1)[..., 0] < -tol
-    others = np.sort(np.where(np.arange(4) == it[..., None], np.inf, rel), axis=-1)[..., 0] > tol
+    _, vectors, norm, it, ok = _eigenframe(T, tol)
     unit = vectors / np.sqrt(np.maximum(np.abs(norm), 1e-300))[..., None]
     u = np.take_along_axis(unit, it[..., None, None], axis=-2)[..., 0, :]
     rest = np.argsort(np.where(np.arange(4) == it[..., None], 4, np.arange(4)), axis=-1)[..., :3]
@@ -5451,27 +5343,18 @@ def principal_observers(T, which, tol=1e-9):
         if "dec" in which:
             mats.append(outer(u, u) - outer(e[..., i, :], e[..., i, :]))
     D = np.stack(mats, axis=-3)
-    return D / np.sqrt((D**2).sum((-1, -2)))[..., None, None], real & timelike & others
+    return D / np.sqrt((D**2).sum((-1, -2)))[..., None, None], ok
 
 
 def slp(prob, which=CONDITIONS, eps=0.02, iters=120, rows_max=4000, per_point=8, trust=0.5, trust_min=2e-3,
-        verbose=False, th0=None, penalty=50.0, clock=None):
+        verbose=False, th0=None, penalty=50.0):
     """Maximise prob.goal(th) subject to every relative margin of prob.tensor(th) being at least eps.
 
     The margins are those of a fixed sample of observers (condition_matrices) and, at every point where T is of
     type I, those of the observers that bind each condition there (principal_observers), which are the exact margins.
     Each step solves a linear program in which the margins may fall short of eps at a cost, and is kept
-    when it raises the merit, the goal less that cost.  With a dict `clock`, the seconds of each phase are appended to
-    clock[phase]: rows (all margins), jacobian, lp and trial (the margins and goal of a trial step)."""
+    when it raises the merit, the goal less that cost."""
     jax, jnp = _jax()
-    clock = {} if clock is None else clock
-
-    def timed(key, fn):
-        t0 = time.time()
-        out = fn()
-        clock.setdefault(key, []).append(time.time() - t0)
-        return out
-
     C = condition_matrices(which)
     sampled_count = C.shape[0]
     sampled_flat = C.reshape(sampled_count, 16).T
@@ -5508,7 +5391,7 @@ def slp(prob, which=CONDITIONS, eps=0.02, iters=120, rows_max=4000, per_point=8,
     goal = jax.jit(prob.goal)
     grad = jax.jit(jax.grad(prob.goal))
     th = np.asarray(prob.initial() if th0 is None else th0, dtype=float)
-    c, D = timed("rows", lambda: rows_at(th))
+    c, D = rows_at(th)
     f = float(goal(jnp.asarray(th)))
     # merit = goal - P * shortfall below 0.6 eps, with P in proportion to the goal reached, so that a margin keeps its
     # weight as the goal grows; the linear programs let a row fall to eps when above it and to 0.75 eps when below
@@ -5535,7 +5418,7 @@ def slp(prob, which=CONDITIONS, eps=0.02, iters=120, rows_max=4000, per_point=8,
         pi, ji = np.repeat(np.arange(c.shape[0]), per_point)[chosen], near.ravel()[chosen]
         among = ji < sampled_count
         Ck = np.where(among[:, None, None], C[np.where(among, ji, 0)], D[pi, np.where(among, 0, ji - sampled_count)])
-        Jm = timed("jacobian", lambda: np.asarray(jac(jnp.asarray(th), jnp.asarray(pi), jnp.asarray(Ck))))
+        Jm = np.asarray(jac(jnp.asarray(th), jnp.asarray(pi), jnp.asarray(Ck)))
         g = np.asarray(grad(jnp.asarray(th)))
         sc = prob.scales(th)
         Js, gs = Jm * sc, g * sc
@@ -5549,13 +5432,13 @@ def slp(prob, which=CONDITIONS, eps=0.02, iters=120, rows_max=4000, per_point=8,
         moved = False
         while trust >= trust_min:
             # a program of a few thousand dense rows solves faster without HiGHS's presolve
-            res = timed("lp", lambda: linprog(cost, A_ub=A, b_ub=rhs, bounds=[(-trust, trust)] * len(th) + [(0.0, None)],
-                                              method="highs", options={"presolve": False}))
+            res = linprog(cost, A_ub=A, b_ub=rhs, bounds=[(-trust, trust)] * len(th) + [(0.0, None)], method="highs",
+                          options={"presolve": False})
             if res.status != 0:
                 trust *= 0.5
                 continue
             d = res.x[: len(th)] * sc
-            cn, Dn = timed("trial", lambda: rows_at(th + d))
+            cn, Dn = rows_at(th + d)
             fn = float(goal(jnp.asarray(th + d)))
             mn = merit(fn, cn) if np.isfinite(fn) and not np.isnan(cn).any() else -np.inf
             if mn > m + 1e-12 * max(abs(m), 1.0):
@@ -5598,8 +5481,28 @@ def radial_tensor_jacobian(name, fields, th, rg, cg):
     return T.reshape(-1, 4, 4), dT.reshape(-1, 4, 4, th.shape[0])
 
 
-class DragProblem:
+class RadialProblem:
+    """A search problem whose jets depend on the radius alone, sampled at the radii rg and cosines cg: a subclass
+    names its `family` and gives jets(th), the jets at rg."""
+
+    def tensor(self, th):
+        """T_ab at every sample point, as an array (points, 4, 4)."""
+        jnp = _jax()[1]
+        c = jnp.asarray(self.cg)[None, :]
+        vals = {k: v[:, None] if jnp.ndim(v) else v for k, v in self.jets(th).items()}
+        vals.update({"c": c, "s": jnp.sqrt(jnp.maximum(1 - c * c, 0.0))})
+        return family_tensor(self.family, vals, "jax").reshape(-1, 4, 4)
+
+    def tensor_jacobian(self, th):
+        """T at every sample point and its derivatives in the parameters, by the chain rule through the jets."""
+        jnp = _jax()[1]
+        return radial_tensor_jacobian(self.family, self.jets, th, jnp.asarray(self.rg), jnp.asarray(self.cg))
+
+
+class DragProblem(RadialProblem):
     """Design variables of the drag family for the profile search: shift f and h, lapse factor g, mass profile q."""
+
+    family = "drag"
 
     def __init__(self, R1, R2, M, deg=14, nr=96, nc=17, smooth=False, free_static=True, objective="xi"):
         jnp = self.jnp = _jax()[1]
@@ -5669,31 +5572,16 @@ class DragProblem:
         psi = 1.0 + self.M / (2 * self.R2) + m["P"] @ cq
         psi_r = -q0 / (2 * r ** 2)
         psi_rr = -q1 / (2 * r ** 2) + q0 / r ** 3
-        l1 = -psi_r / (2 - psi) - psi_r / psi + m["w1"] @ cg
-        l2 = (-psi_rr / (2 - psi) - psi_r ** 2 / (2 - psi) ** 2 - psi_rr / psi + psi_r ** 2 / psi ** 2
-              + m["w2"] @ cg)
-        N = (2 - psi) / psi * jnp.exp(m["w0"] @ cg)
-        out = {"r": r, "psi": psi, "psi_r": psi_r, "psi_rr": psi_rr, "N": N, "N_r": N * l1,
-               "N_rr": N * (l2 + l1 ** 2)}
+        N, N_r, N_rr = lapse_jets(psi, psi_r, psi_rr, m["w0"] @ cg, m["w1"] @ cg, m["w2"] @ cg, jnp)
+        out = {"r": r, "psi": psi, "psi_r": psi_r, "psi_rr": psi_rr, "N": N, "N_r": N_r, "N_rr": N_rr}
         for nm, co in (("f", cf), ("h", ch)):
             for k, suf in enumerate(("", "_r", "_rr")):
                 out[nm + suf] = m["s%d" % k] @ co
         return out
 
-    def tensor(self, th):
-        """T_ab at every sample point, as an array (points, 4, 4)."""
-        jnp = self.jnp
-        fl = self.fields(self.unpack(th), "g")
-        c = jnp.asarray(self.cg)[None, :]
-        vals = {k: v[:, None] for k, v in fl.items()}
-        vals.update({"c": c, "s": jnp.sqrt(jnp.maximum(1 - c * c, 0.0)), "b": 1.0, "b_t": 0.0})
-        return family_tensor("drag", vals, "jax").reshape(-1, 4, 4)
-
-    def tensor_jacobian(self, th):
-        """T at every sample point and its derivatives in the parameters, by the chain rule through the jets."""
-        jnp = self.jnp
-        return radial_tensor_jacobian("drag", lambda p: dict(self.fields(self.unpack(p), "g"), b=1.0, b_t=0.0), th,
-                                      jnp.asarray(self.rg), jnp.asarray(self.cg))
+    def jets(self, th):
+        """The jets at the sample radii, the shift's amplitude 1."""
+        return dict(self.fields(self.unpack(th), "g"), b=1.0, b_t=0.0)
 
     def goal(self, th):
         """The objective: light-time asymmetry, or the interior drift speed."""
@@ -5717,7 +5605,7 @@ class DragProblem:
         cf, ch, cg, cq = (np.asarray(x) for x in self.unpack(self.jnp.asarray(th)))
         q = Bern(self.R1, self.R2, cq)
         return DragDesign(self.R1, self.R2, self.M, Bern(self.ra, self.rb, cf), Bern(self.ra, self.rb, ch),
-                          psi=ConformalQ(self.R1, self.R2, self.M, q), g=Bern(self.R1, self.R2, cg))
+                          psi=Conformal(self.R1, self.R2, self.M, q), g=Bern(self.R1, self.R2, cg))
 
 
 # --- rocket designs ----------------------------------------------------------
@@ -5780,13 +5668,8 @@ class RocketDesign:
 
     def values(self, r, c):
         """All arguments of the closed forms at radius r and c = cos(theta)."""
-        r, c = np.broadcast_arrays(np.asarray(r, dtype=float), np.asarray(c, dtype=float))
-        ru, inv = np.unique(r, return_inverse=True)
-        inv = inv.reshape(r.shape)
-        v = {k: np.broadcast_to(np.asarray(x, dtype=float), ru.shape)[inv] for k, x in
-             rocket_fields(self.R1, self.R2, self.kappa, self.a, self.cm, self.cU, self.cV, self.ce, ru).items()}
-        v.update({"c": c, "s": np.sqrt(np.maximum(1 - c * c, 0.0))})
-        return v
+        return radial_values(r, c, lambda ru: rocket_fields(self.R1, self.R2, self.kappa, self.a, self.cm, self.cU,
+                                                            self.cV, self.ce, ru))
 
     def tensor(self, r, c):
         """T_ab on the orthonormal frame built from the null frame."""
@@ -5842,8 +5725,10 @@ class RocketDesign:
         return worst
 
 
-class RocketProblem:
+class RocketProblem(RadialProblem):
     """Design variables of the rocket family: acceleration a, dipole profiles U, V, e and the mass profile m."""
+
+    family = "rocket"
 
     def __init__(self, R1, R2, M, deg=14, nr=96, nc=17, kappa=1.25, drag=1.0, free_static=True):
         jnp = self.jnp = _jax()[1]
@@ -5892,22 +5777,9 @@ class RocketProblem:
         ce = jnp.concatenate([jnp.zeros(2), th[1 + 2 * n:1 + 3 * n], jnp.zeros(2)])
         return a, cm, cU, cV, ce
 
-    def tensor(self, th):
-        """T_ab at every sample point, as an array (points, 4, 4)."""
-        jnp = self.jnp
-        a, cm, cU, cV, ce = self.unpack(th)
-        fl = rocket_fields(self.R1, self.R2, self.kappa, a, cm, cU, cV, ce, self.rg, jnp)
-        c = jnp.asarray(self.cg)[None, :]
-        vals = {k: v[:, None] for k, v in fl.items()}
-        vals.update({"c": c, "s": jnp.sqrt(jnp.maximum(1 - c * c, 0.0))})
-        return family_tensor("rocket", vals, "jax").reshape(-1, 4, 4)
-
-    def tensor_jacobian(self, th):
-        """T at every sample point and its derivatives in the parameters, by the chain rule through the jets."""
-        jnp = self.jnp
-        return radial_tensor_jacobian(
-            "rocket", lambda p: rocket_fields(self.R1, self.R2, self.kappa, *self.unpack(p), self.rg, jnp), th,
-            jnp.asarray(self.rg), jnp.asarray(self.cg))
+    def jets(self, th):
+        """The jets at the sample radii."""
+        return rocket_fields(self.R1, self.R2, self.kappa, *self.unpack(th), self.rg, self.jnp)
 
     def goal(self, th):
         """The objective: the acceleration."""
@@ -6004,7 +5876,6 @@ def shape_jets(d, c, order=4):
 def exhaust_shape(ma, lmax):
     """The wavefront shape of lmax Legendre modes with zero net momentum that loses the least mass per rapidity:
     the efficiency m a / (-m_u), gravitational waves included, and the coefficients."""
-    from scipy.optimize import minimize
     c, wt = np.cos(EXHAUST_TH), np.sin(EXHAUST_TH) * np.pi / (len(EXHAUST_TH) - 1)
 
     def F(d):
@@ -6014,8 +5885,8 @@ def exhaust_shape(ma, lmax):
         return np.sum(wt * c * np.exp(-3 * shape_jets(d, c, 0)[0]))
 
     cons = [{"type": "ineq", "fun": lambda x: x[-1] - F(x[:-1])}, {"type": "eq", "fun": lambda x: momentum(x[:-1])}]
-    res = minimize(lambda x: x[-1], np.concatenate([np.zeros(lmax), [6 * ma]]), constraints=cons, method="SLSQP",
-                   options={"maxiter": 1000, "ftol": 1e-14})
+    res = scipy.optimize.minimize(lambda x: x[-1], np.concatenate([np.zeros(lmax), [6 * ma]]), constraints=cons,
+                                  method="SLSQP", options={"maxiter": 1000, "ftol": 1e-14})
     d = res.x[:-1]
     return 2 * ma / F(d).max(), d
 
@@ -6359,19 +6230,6 @@ def hull_static_check(prob):
 
 # --- searches, verified exactly on a fine grid -------------------------------
 
-def exact_scale(ok, safety=0.98, iters=30):
-    """1 when ok(1); otherwise a safety factor times the largest s in [0, 1] with ok(s)."""
-    if ok(1.0):
-        return 1.0
-    if not ok(0.0):
-        return float("nan")
-    lo, hi = 0.0, 1.0
-    for _ in range(iters):
-        mid = (lo + hi) / 2
-        lo, hi = (mid, hi) if ok(mid) else (lo, mid)
-    return safety * lo
-
-
 def drag_search(R1, R2, M, which=CONDITIONS, refine=False, verbose=False, deg=14):
     """Optimise a drag shell of mass M; returns (design, amplitude, summary) verified on the fine grid, or None."""
     prob = DragProblem(R1, R2, M, deg=deg, free_static=False)
@@ -6382,19 +6240,25 @@ def drag_search(R1, R2, M, which=CONDITIONS, refine=False, verbose=False, deg=14
         th0 = np.concatenate([th, [0.0], np.zeros(prob2.nfree), M * prob2.mass0[prob2.kq:-prob2.kq]])
         th2, _ = slp(prob2, which=which, verbose=verbose, th0=th0, trust=0.05)
         cands.append(prob2.design(th2))
-    grid = wall_grid(R1, R2, 401, 65)
     best = None
     for d in cands:
-        def ok(s, d=d):
-            w = d.worst(s, 0.0, grid)
-            return d.timelike(s) and all(w[k] >= -1e-9 for k in which)
-
-        s = exact_scale(ok)
-        if s == s:
-            rep = d.summary(s, grid)
-            if best is None or rep["xi"] > best[2]["xi"]:
-                best = (d, s, rep)
+        got = drag_scaled(d, which)
+        if got is not None and (best is None or got[1]["xi"] > best[2]["xi"]):
+            best = (d, *got)
     return best
+
+
+def drag_scaled(d, which):
+    """The shift amplitude at which a drag design holds the conditions and light crosses its axis both ways, 1 or a
+    safety factor times the largest such amplitude below 1, and its summary there; None when none holds them."""
+    grid = wall_grid(d.R1, d.R2, 401, 65)
+
+    def ok(s):
+        w = d.worst(s, 0.0, grid)
+        return d.timelike(s) and all(w[k] >= -1e-9 for k in which)
+
+    s = exact_scale(ok)
+    return (s, d.summary(s, grid)) if s == s else None
 
 
 def drag_ramp(design, s_max, which=CONDITIONS, ns=9):
@@ -6493,6 +6357,50 @@ def ad_einstein(metric):
     return jax.jit(einstein)
 
 
+def _drag_metric(N, psi, f, h, b, c, s, r):
+    """The drag family's metric from its profiles at a point, a jax array."""
+    jnp = _jax()[1]
+    br, bth = b * f * c, -b * h * s / r
+    p4 = psi ** 4
+    g = jnp.zeros((4, 4))
+    g = g.at[0, 0].set(-N ** 2 + p4 * (br ** 2 + r ** 2 * bth ** 2))
+    g = g.at[0, 1].set(p4 * br).at[1, 0].set(p4 * br)
+    g = g.at[0, 2].set(p4 * r ** 2 * bth).at[2, 0].set(p4 * r ** 2 * bth)
+    return g.at[1, 1].set(p4).at[2, 2].set(p4 * r ** 2).at[3, 3].set(p4 * r ** 2 * s ** 2)
+
+
+def _drag_frame(N, psi, f, h, b, c, s, r):
+    """The orthonormal frame of the drag family's closed forms, the Eulerian observer first."""
+    return np.array([[1 / N, -b * f * c / N, b * h * s / (r * N), 0], [0, 1 / psi ** 2, 0, 0],
+                     [0, 0, 1 / (psi ** 2 * r), 0], [0, 0, 0, 1 / (psi ** 2 * r * s)]])
+
+
+def _rocket_metric(E, e, m, W, U, c, s, r):
+    """The rocket family's metric from its profiles at a point, a jax array."""
+    jnp = _jax()[1]
+    Eb, H = E * (1 + e * c), 1 - 2 * m / r + 2 * W * c
+    g = jnp.zeros((4, 4))
+    g = g.at[0, 0].set(-Eb ** 2 * H + U ** 2 * r ** 2 * s ** 2)
+    g = g.at[0, 1].set(-Eb).at[1, 0].set(-Eb)
+    g = g.at[0, 2].set(-U * r ** 2 * s).at[2, 0].set(-U * r ** 2 * s)
+    return g.at[2, 2].set(r ** 2).at[3, 3].set(r ** 2 * s ** 2)
+
+
+def _rocket_frame(E, e, m, W, U, c, s, r):
+    """The orthonormal frame of the rocket family's closed forms, from its null vectors k and l."""
+    Eb, H = E * (1 + e * c), 1 - 2 * m / r + 2 * W * c
+    k = np.array([0, 1.0, 0, 0])
+    l = np.array([1 / Eb, -H / 2, U * s / Eb, 0])
+    rt = math.sqrt(2.0)
+    return np.array([(k + l) / rt, (k - l) / rt, [0, 0, 1 / r, 0], [0, 0, 0, 1 / (r * s)]])
+
+
+def _departure(frame, einstein, closed):
+    """The largest difference of the autodiff tensor `einstein` on `frame` from the closed forms' tensor, relative to
+    the latter's largest component."""
+    return np.abs(frame @ np.asarray(einstein) @ frame.T - closed).max() / np.abs(closed).max()
+
+
 def jet_values(fn, x0, r, mixed):
     """Value and derivatives (r, x0, rr, r x0) of a jax function fn(x0, r), keyed by suffix."""
     jax = _jax()[0]
@@ -6516,31 +6424,17 @@ def ad_check_drag(rng, trials=8):
         t, r, th = x[0], x[1], x[2]
         return [fns[k](t, r) for k in ("N", "psi", "f", "h")] + [bfun(t), jnp.cos(th), jnp.sin(th), r]
 
-    def metric(x):
-        N, psi, f, h, b, c, s, r = parts(x)
-        br, bth = b * f * c, -b * h * s / r
-        p4 = psi ** 4
-        g = jnp.zeros((4, 4))
-        g = g.at[0, 0].set(-N ** 2 + p4 * (br ** 2 + r ** 2 * bth ** 2))
-        g = g.at[0, 1].set(p4 * br).at[1, 0].set(p4 * br)
-        g = g.at[0, 2].set(p4 * r ** 2 * bth).at[2, 0].set(p4 * r ** 2 * bth)
-        return g.at[1, 1].set(p4).at[2, 2].set(p4 * r ** 2).at[3, 3].set(p4 * r ** 2 * s ** 2)
-
-    G = ad_einstein(metric)
+    G = ad_einstein(lambda x: _drag_metric(*parts(x)))
     worst = 0.0
     for _ in range(trials):
         t, r, th = rng.uniform(-1, 1), rng.uniform(0.8, 2.5), rng.uniform(0.3, 2.8)
         x = jnp.array([t, r, th, 0.3])
-        N, psi, f, h, b, c, s, _ = [float(v) for v in parts(x)]
-        vals = {"r": r, "c": c, "s": s, "b": b, "b_t": float(jax.grad(bfun)(t))}
+        at = [float(v) for v in parts(x)]
+        vals = {"r": r, "c": at[5], "s": at[6], "b": at[4], "b_t": float(jax.grad(bfun)(t))}
         for nm in ("N", "psi", "f", "h"):
             for suf, v in jet_values(fns[nm], t, r, False).items():
                 vals[nm + suf] = v
-        frame = np.array([[1 / N, -b * f * c / N, b * h * s / (r * N), 0], [0, 1 / psi ** 2, 0, 0],
-                          [0, 0, 1 / (psi ** 2 * r), 0], [0, 0, 0, 1 / (psi ** 2 * r * s)]])
-        Tad = frame @ np.asarray(G(x)) @ frame.T
-        Tcf = family_tensor("drag", vals)
-        worst = max(worst, np.abs(Tad - Tcf).max() / np.abs(Tcf).max())
+        worst = max(worst, _departure(_drag_frame(*at), G(x), family_tensor("drag", vals)))
     return worst
 
 
@@ -6555,34 +6449,17 @@ def ad_check_rocket(rng, trials=8):
         u, r, th = x[0], x[1], x[2]
         return [fns[k](u, r) for k in ROCKET_FUNCS] + [jnp.cos(th), jnp.sin(th), r]
 
-    def metric(x):
-        E, e, m, W, U, c, s, r = parts(x)
-        Eb = E * (1 + e * c)
-        H = 1 - 2 * m / r + 2 * W * c
-        g = jnp.zeros((4, 4))
-        g = g.at[0, 0].set(-Eb ** 2 * H + U ** 2 * r ** 2 * s ** 2)
-        g = g.at[0, 1].set(-Eb).at[1, 0].set(-Eb)
-        g = g.at[0, 2].set(-U * r ** 2 * s).at[2, 0].set(-U * r ** 2 * s)
-        return g.at[2, 2].set(r ** 2).at[3, 3].set(r ** 2 * s ** 2)
-
-    G = ad_einstein(metric)
+    G = ad_einstein(lambda x: _rocket_metric(*parts(x)))
     worst = 0.0
     for _ in range(trials):
         u, r, th = rng.uniform(-1, 1), rng.uniform(0.8, 2.5), rng.uniform(0.3, 2.8)
         x = jnp.array([u, r, th, 0.3])
-        E, e, m, W, U, c, s, _ = [float(v) for v in parts(x)]
-        vals = {"r": r, "c": c, "s": s}
+        at = [float(v) for v in parts(x)]
+        vals = {"r": r, "c": at[5], "s": at[6]}
         for nm in ROCKET_FUNCS:
             for suf, v in jet_values(fns[nm], u, r, True).items():
                 vals[nm + suf] = v
-        Eb, H = E * (1 + e * c), 1 - 2 * m / r + 2 * W * c
-        k = np.array([0, 1.0, 0, 0])
-        l = np.array([1 / Eb, -H / 2, U * s / Eb, 0])
-        rt = math.sqrt(2.0)
-        frame = np.array([(k + l) / rt, (k - l) / rt, [0, 0, 1 / r, 0], [0, 0, 0, 1 / (r * s)]])
-        Tad = frame @ np.asarray(G(x)) @ frame.T
-        Tcf = family_tensor("rocket", vals)
-        worst = max(worst, np.abs(Tad - Tcf).max() / np.abs(Tcf).max())
+        worst = max(worst, _departure(_rocket_frame(*at), G(x), family_tensor("rocket", vals)))
     return worst
 
 
@@ -6601,13 +6478,7 @@ def drag_metric(x, p):
     psi = jnp.where(r >= R2, 1 + M / (2 * r), 1 + M / (2 * R2) + half * jnp.sum(qn / (2 * nodes ** 2) * GL_W))
     N = (2 - psi) / psi * jnp.exp(bern_eval(p["g"], jnp.clip((r - R1) / (R2 - R1), 0.0, 1.0), 0, jnp))
     ts = jnp.clip((r - ra) / (rb - ra), 0.0, 1.0)
-    br, bth = b * bern_eval(p["f"], ts, 0, jnp) * c, -b * bern_eval(p["h"], ts, 0, jnp) * s / r
-    p4 = psi ** 4
-    g = jnp.zeros((4, 4))
-    g = g.at[0, 0].set(-N ** 2 + p4 * (br ** 2 + r ** 2 * bth ** 2))
-    g = g.at[0, 1].set(p4 * br).at[1, 0].set(p4 * br)
-    g = g.at[0, 2].set(p4 * r ** 2 * bth).at[2, 0].set(p4 * r ** 2 * bth)
-    return g.at[1, 1].set(p4).at[2, 2].set(p4 * r ** 2).at[3, 3].set(p4 * r ** 2 * s ** 2)
+    return _drag_metric(N, psi, bern_eval(p["f"], ts, 0, jnp), bern_eval(p["h"], ts, 0, jnp), b, c, s, r)
 
 
 def ad_check_drag_design(design, b, rng, trials=6):
@@ -6628,11 +6499,8 @@ def ad_check_drag_design(design, b, rng, trials=6):
         th = rng.uniform(0.3, 2.8)
         v = design.values(r, math.cos(th), b)
         N, psi, f, h, c, s = (float(v[k]) for k in ("N", "psi", "f", "h", "c", "s"))
-        frame = np.array([[1 / N, -b * f * c / N, b * h * s / (r * N), 0], [0, 1 / psi ** 2, 0, 0],
-                          [0, 0, 1 / (psi ** 2 * r), 0], [0, 0, 0, 1 / (psi ** 2 * r * s)]])
-        Tad = frame @ np.asarray(G(jnp.array([0.1, r, th, 0.3]))) @ frame.T
-        Tcf = design.tensor(r, math.cos(th), b)
-        worst = max(worst, np.abs(Tad - Tcf).max() / np.abs(Tcf).max())
+        frame = _drag_frame(N, psi, f, h, b, c, s, r)
+        worst = max(worst, _departure(frame, G(jnp.array([0.1, r, th, 0.3])), design.tensor(r, math.cos(th), b)))
     return worst
 
 
@@ -6652,36 +6520,15 @@ def ad_check_rocket_design(design, rng, trials=6):
         return (E, bern_eval(p["ce"], t, 0, jnp), bern_eval(cmu, t, 0, jnp), bern_eval(p["cV"], t, 0, jnp) / E ** 2,
                 bern_eval(p["cU"], t, 0, jnp), jnp.cos(x[2]), jnp.sin(x[2]), r)
 
-    def metric(x, p):
-        E, e, m, W, U, c, s, r = parts(x, p)
-        Eb = E * (1 + e * c)
-        H = 1 - 2 * m / r + 2 * W * c
-        g = jnp.zeros((4, 4))
-        g = g.at[0, 0].set(-Eb ** 2 * H + U ** 2 * r ** 2 * s ** 2)
-        g = g.at[0, 1].set(-Eb).at[1, 0].set(-Eb)
-        g = g.at[0, 2].set(-U * r ** 2 * s).at[2, 0].set(-U * r ** 2 * s)
-        return g.at[2, 2].set(r ** 2).at[3, 3].set(r ** 2 * s ** 2)
-
     if "rocket" not in _AD:
-        _AD["rocket"] = ad_einstein(metric)
-
-    def G(x):
-        return _AD["rocket"](x, p)
-
+        _AD["rocket"] = ad_einstein(lambda x, p: _rocket_metric(*parts(x, p)))
     worst = 0.0
     for _ in range(trials):
         r = rng.uniform(R1 + 0.02, R2 - 0.02)
         th = rng.uniform(0.3, 2.8)
         x = jnp.array([0.0, r, th, 0.3])
-        E, e, m, W, U, c, s, _ = (float(v) for v in parts(x, p))
-        Eb, H = E * (1 + e * c), 1 - 2 * m / r + 2 * W * c
-        k = np.array([0, 1.0, 0, 0])
-        l = np.array([1 / Eb, -H / 2, U * s / Eb, 0])
-        rt = math.sqrt(2.0)
-        frame = np.array([(k + l) / rt, (k - l) / rt, [0, 0, 1 / r, 0], [0, 0, 0, 1 / (r * s)]])
-        Tad = frame @ np.asarray(G(x)) @ frame.T
-        Tcf = design.tensor(r, math.cos(th))
-        worst = max(worst, np.abs(Tad - Tcf).max() / np.abs(Tcf).max())
+        frame = _rocket_frame(*(float(v) for v in parts(x, p)))
+        worst = max(worst, _departure(frame, _AD["rocket"](x, p), design.tensor(r, math.cos(th))))
     return worst
 
 
@@ -6749,9 +6596,7 @@ def ad_check_beam(rng, trials=3):
         E, V, Hv = (float(f(u, r, c)) for f in (fns["E"], fns["V"], H))
         k, l = np.array([0, 1.0, 0, 0]), np.array([1 / E, -Hv / 2, 0, 0])
         frame = np.array([(k + l) / math.sqrt(2), (k - l) / math.sqrt(2), [0, 0, V / r, 0], [0, 0, 0, V / (r * s)]])
-        Tad = frame @ np.asarray(G(jnp.array([u, r, th, 0.3]))) @ frame.T
-        Tcf = family_tensor("beam", vals)
-        worst = max(worst, np.abs(Tad - Tcf).max() / np.abs(Tcf).max())
+        worst = max(worst, _departure(frame, G(jnp.array([u, r, th, 0.3])), family_tensor("beam", vals)))
     return worst
 
 
@@ -6851,6 +6696,25 @@ SECTION_FORMS = {
     "D33": ("Ph lam", "lam - Ph*Ph"),
     "trace": ("E Sr Th Ph", "- E + Sr + Th + Ph"),
 }
+# Each definition applied to a certificate's components tE ... tP, its section's variables E a d Sr x Th Ph, and to lam.
+_SECTION_ARGUMENTS = dict(zip("E a d Sr x Th Ph".split(), ("(t%s r c)" % k for k in ORTHO)), lam="(lam r)")
+SECTION_APPLIED = {name: " ".join([name] + [_SECTION_ARGUMENTS[p] for p in params.split()])
+                   for name, (params, _) in SECTION_FORMS.items()}
+# What `certified` requires to be non-negative, in the order of its hypotheses: diagonal dominance of T + mu eta with
+# mu >= 0 and the strong condition's bound on mu, then that of lam eta - T eta T with lam >= 0.
+CERTIFICATE_ROWS = (
+    ("n0", "tE r c - mu r - Rabs (ta r c) - Rabs (td r c)"),
+    ("n1", "tS r c + mu r - Rabs (ta r c) - Rabs (tx r c)"),
+    ("n2", "tT r c + mu r - Rabs (td r c) - Rabs (tx r c)"),
+    ("n3", "tP r c + mu r"),
+    ("m", "mu r"),
+    ("s", "mu r + {trace} / 2"),
+    ("d0", "{D00} - Rabs ({D01}) - Rabs ({D02})"),
+    ("d1", "{D11} - Rabs ({D01}) - Rabs ({D12})"),
+    ("d2", "{D22} - Rabs ({D02}) - Rabs ({D12})"),
+    ("d3", "{D33}"),
+    ("l", "lam r"),
+)
 WALL = (("var", 0), ("var", 1))  # the trees of r and c on the wall
 # The atoms of field's expressions: the depth r - 1, in which field normalises, then r, c and s.
 DEPTH = {"r": ("var", 1), "c": ("var", 2), "s": ("var", 3)}
@@ -6942,6 +6806,27 @@ def tree_text(tree):
     return "(Tree.Ebinary Tree.%s %s %s)" % (tree[1], tree_text(tree[2]), tree_text(tree[3]))
 
 
+def tree_value(tree, variables, refs):
+    """The value of a tree of `term_tree` at arrays of its variables, with the values of the trees it names in refs."""
+    kind = tree[0]
+    if kind == "int":
+        return float(tree[1])
+    if kind == "var":
+        return variables[tree[1]]
+    if kind == "ref":
+        return refs[tree[1]]
+    x = tree_value(tree[2], variables, refs)
+    if kind == "pow":
+        return x ** tree[1]
+    if kind == "op1":
+        return TREE_UNARY[tree[1]](x)
+    return TREE_BINARY[tree[1]](x, tree_value(tree[3], variables, refs))
+
+
+TREE_UNARY = {"Sqr": lambda x: x * x, "Neg": np.negative, "Inv": lambda x: 1.0 / x, "Abs": np.abs, "Sqrt": np.sqrt}
+TREE_BINARY = {"Add": np.add, "Sub": np.subtract, "Mul": np.multiply, "Div": np.divide}
+
+
 def field_text(tree):
     """Rocq source for a tree of `term_tree`, as field's FExpr over Z; the variable k is the list's (k + 1)th, and
     r - 1 is the first."""
@@ -6966,22 +6851,10 @@ def field_text(tree):
 # which their tactics run on the trees they reify, run here on the trees that `term_tree` writes, and checked once,
 # by the kernel at Qed.
 CERTIFICATE_LEMMAS = """\
-(* Interval's bisection on the tree of an expression.  The rows of the certificates below are proved with it:
-   nacelle shells certify writes each row's tree, which Interval's tactic would build by reification, and the
-   kernel runs the bisection once, at Qed, on its virtual machine. *)
-Lemma tree_bound e vars hyps g prec depth idx :
-  match Prog.extract e (length vars) with
-  | Prog.Eabort => false
-  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect prec depth idx hyps lp lc g
-  end = true ->
-  Reify.eval_hyps hyps vars (Reify.eval_goal g (Tree.eval e vars)).
-Proof.
-  intros H. generalize (Prog.extract_correct e vars).
-  destruct (Prog.extract e (length vars)) as [|lp lc]; [discriminate |].
-  intros <-. exact (Private.IT2.IH.eval_bisect_correct prec depth idx vars hyps lp lc g H).
-Qed.
-
-(* the wall 1 <= r <= 2, -1 <= c <= 1, cut in r and in c to a depth of 40, and the goal 0 <= e *)
+(* Interval's bisection on the tree of an expression e, over the wall 1 <= r <= 2, -1 <= c <= 1 cut in r and in c
+   to a depth of 40, for the goal 0 <= e.  The rows of the certificates below are proved with it: nacelle shells
+   certify writes each row's tree, which Interval's tactic would build by reification, and the kernel runs the
+   bisection once, at Qed, on its virtual machine. *)
 Definition wall_hyps : list (list Reify.hyp) :=
   ((Reify.Hlele true true (Tree.Econst (Tree.Int 1)) (Tree.Econst (Tree.Int 2)) :: nil)
    :: (Reify.Hlele true true (Tree.Econst (Tree.Int (-1))) (Tree.Econst (Tree.Int 1)) :: nil) :: nil)%list.
@@ -6997,8 +6870,11 @@ Definition wall_check (e : Tree.expr) : bool :=
 Lemma wall_nonneg e : wall_check e = true ->
   forall r c, 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= Tree.eval e (r :: c :: nil).
 Proof.
-  intros H r c.
-  exact (tree_bound e (r :: c :: nil)%list wall_hyps wall_goal 53%Z 40 (0%nat :: 1%nat :: nil)%list H).
+  intros H r c. generalize (Prog.extract_correct e (r :: c :: nil)%list).
+  change (length (r :: c :: nil)%list) with 2%nat. unfold wall_check in H.
+  destruct (Prog.extract e 2) as [|lp lc]; [discriminate |].
+  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 1%nat :: nil)%list (r :: c :: nil)%list
+                      wall_hyps lp lc wall_goal H).
 Qed.
 
 Ltac wall e r c :=
@@ -7038,7 +6914,7 @@ Proof.
   cbn. ring.
 Qed.
 
-Ltac nonzero := repeat split; first [ lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
+Ltac nonzero := repeat split; first [ exact I | lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
 
 Ltac identity r c s fe1 fe2 :=
   let N := fresh in
@@ -7107,30 +6983,10 @@ def closed_shell(family, jets):
     return gen, {k: sp.cancel(sp.together(gen[k].subs(table))) for k in keys}
 
 
-def ortho_components(family, X, H0=None):
-    """The seven components E a d S x T P on an orthonormal frame, as sympy expressions in r, c, s."""
-    if family == "drag":
-        return dict(zip(ORTHO, [X[k] for k in DRAG_KEYS]))
-    kk, kl, ll, k2, l2, t22, t33 = [X[k] for k in ROCKET_KEYS]
-    root = sp.sqrt(H0)
-    return {"E": (H0 * kk / 2 + 2 * kl + 2 * ll / H0) / 2, "a": (H0 * kk / 2 - 2 * ll / H0) / 2,
-            "d": (H0 * k2 / 2 + l2) / root, "S": (H0 * kk / 2 - 2 * kl + 2 * ll / H0) / 2,
-            "x": (H0 * k2 / 2 - l2) / root, "T": t22, "P": t33}
-
-
-def certificate_rows(comp, mu, lam):
-    """The quantities that the diagonal-dominance certificate requires to be non-negative."""
-    E, a, d, S, x, T, P = (comp[k] for k in ORTHO)
-    D00, D01, D02 = -lam + E * E - a * a - d * d, E * a - a * S - d * x, E * d - a * x - d * T
-    D11, D12, D22, D33 = lam + a * a - S * S - x * x, a * d - x * (S + T), lam + d * d - x * x - T * T, lam - P * P
-    ab = np.abs
-    return {"n0": E - mu - ab(a) - ab(d), "n1": S + mu - ab(a) - ab(x), "n2": T + mu - ab(d) - ab(x),
-            "n3": P + mu, "s": mu + (-E + S + T + P) / 2, "d0": D00 - ab(D01) - ab(D02),
-            "d1": D11 - ab(D01) - ab(D12), "d2": D22 - ab(D02) - ab(D12), "d3": D33}
-
-
-def certificate_module(module, family, jets, rho, k1, k2, note, H0=None):
-    """The Rocq module proving the four energy conditions for a closed-form shell on 1 <= r <= 2."""
+def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201, nth=81):
+    """The Rocq module proving the four energy conditions for a closed-form shell on 1 <= r <= 2, with the exact
+    margins and the least certificate rows on a grid of nr radii and nth angles over the wall, which the trees of the
+    module give, the rows relative to rho, those of lam eta - T eta T to rho^2."""
     fn, argnames, keys = FAMILIES[family]
     jetnames = [a for a in argnames if a not in ("r", "c", "s", "b", "b_t")]
     gen, X = closed_shell(family, jets)
@@ -7201,86 +7057,72 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None):
     L += [""] + ["Definition %s (r : R) : R := %s." % (name, forms[name][1]) for name in ("rho", "mu", "lam")] + [""]
     # Interval's trees of the density and the components, which the rows' trees name
     L.append("(* the trees of rho and of the components, of which the rows' trees are built *)")
-    shared = {}
+    shared, value = {}, {}
+    rg, thg = np.meshgrid(wall_radii(1.0, 2.0, nr), np.linspace(0.0, np.pi, nth), indexing="ij")
+    wall = (rg, np.cos(thg))
     for name in ["rho"] + (["H0"] if "H0" in forms else []) + ["t" + k for k in ORTHO]:
         params, text = forms[name]
         tree = term_tree(text, forms, dict(zip(params, WALL)), shared)
         shared[name] = "tree_" + (name[1:] if name[0] == "t" else name)
+        value[shared[name]] = tree_value(tree, wall, value) + np.zeros(rg.shape)
         L.append("Definition %s : Tree.expr := %s." % (shared[name], tree_text(tree)))
     L.append("")
-    g = {k: "(t%s r c)" % k for k in ORTHO}
-
-    def app(f, ks, extra=""):
-        return "%s %s%s" % (f, " ".join(g[k] for k in ks), extra)
-
-    la = " (lam r)"
-    D = {"D00": app("D00", "Ead", la), "D01": app("D01", "EadSx"), "D02": app("D02", "EadxT"),
-         "D11": app("D11", "aSx", la), "D12": app("D12", "adSxT"), "D22": app("D22", "dxT", la),
-         "D33": app("D33", "P", la)}
-    rows = [("n0", "tE r c - mu r - Rabs (ta r c) - Rabs (td r c)"),
-            ("n1", "tS r c + mu r - Rabs (ta r c) - Rabs (tx r c)"),
-            ("n2", "tT r c + mu r - Rabs (td r c) - Rabs (tx r c)"),
-            ("n3", "tP r c + mu r"), ("m", "mu r"), ("s", "mu r + %s / 2" % app("trace", "ESTP")),
-            ("d0", "%s - Rabs (%s) - Rabs (%s)" % (D["D00"], D["D01"], D["D02"])),
-            ("d1", "%s - Rabs (%s) - Rabs (%s)" % (D["D11"], D["D01"], D["D12"])),
-            ("d2", "%s - Rabs (%s) - Rabs (%s)" % (D["D22"], D["D02"], D["D12"])),
-            ("d3", D["D33"]), ("l", "lam r")]
-    for nm, stmt in rows:
-        tree = tree_text(term_tree(stmt, forms, {"r": WALL[0], "c": WALL[1]}, shared))
+    rows, density = {}, value["tree_rho"]
+    for nm, stmt in CERTIFICATE_ROWS:
+        stmt = stmt.format(**SECTION_APPLIED)
+        tree = term_tree(stmt, forms, {"r": WALL[0], "c": WALL[1]}, shared)
+        if nm not in ("m", "l"):
+            rows[nm] = float((tree_value(tree, wall, value) / density ** (2 if nm[0] == "d" else 1)).min())
         L += ["Lemma row_%s r c : 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= %s." % (nm, stmt),
-              "Proof. wall %s r c. Qed." % tree, ""]
-    allg = " ".join(g[k] for k in ORTHO)
-    w = [app("w0", "Ead"), app("w1", "aSx"), app("w2", "dxT"), app("w3", "P")]
-    kk = " k0 k1 k2 k3"
+              "Proof. wall %s r c. Qed." % tree_text(tree), ""]
+    allg = " ".join("(t%s r c)" % k for k in ORTHO)
     L += ["(* every energy condition, for every observer, at every point of the wall *)",
-          "Theorem shell_energy_conditions r c : 1 <= r <= 2 -> -1 <= c <= 1 ->",
-          "  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 = 0 -> 0 <= Tq %s k0 k1 k2 k3) /\\" % allg,
-          "  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 -> 0 <= Tq %s k0 k1 k2 k3) /\\" % allg,
-          "  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 ->",
-          "     0 <= Tq %s k0 k1 k2 k3 - %s / 2 * eta k0 k1 k2 k3) /\\" % (allg, app("trace", "ESTP")),
-          "  (forall k0 k1 k2 k3, 0 <= k0 -> eta k0 k1 k2 k3 <= 0 ->",
-          "     0 <= %s%s /\\" % (w[0], kk),
-          "     %s%s * (%s%s) + %s%s * (%s%s) + %s%s * (%s%s)" % (w[1], kk, w[1], kk, w[2], kk, w[2], kk, w[3], kk, w[3], kk),
-          "       <= %s%s * (%s%s))." % (w[0], kk, w[0], kk),
+          "Theorem shell_energy_conditions r c : 1 <= r <= 2 -> -1 <= c <= 1 -> energy_conditions %s." % allg,
           "Proof.", "  intros Hr Hc.", "  apply (certified %s (mu r) (lam r))." % allg]
-    for nm in ("n0", "n1", "n2", "n3", "m", "s", "d0", "d1", "d2", "d3", "l"):
-        L.append("  - pose proof (row_%s r c Hr Hc). lra." % nm)
-    L += ["Qed.", ""]
+    L += ["  - pose proof (row_%s r c Hr Hc). lra." % nm for nm, _ in CERTIFICATE_ROWS] + ["Qed.", ""]
+    E, a, d, S, x, T, P = (value["tree_" + k] for k in ORTHO)
+    z = np.zeros(rg.shape)
+    Tab = np.stack([np.stack(row, -1) for row in ([E, a, d, z], [a, S, x, z], [d, x, T, z], [z, z, z, P])], -2)
     if family == "rocket":
         L += ["(* outside the wall the solution is Kinnersley's photon rocket: null dust whose density is a",
               "   positive multiple of -(m_u + 3 m a c), with m_u = -3 kappa a m on this shell *)",
               "Lemma exhaust_nonnegative m a kappa c :",
               "  0 <= m -> 0 <= a -> 1 <= kappa -> -1 <= c <= 1 -> 0 <= - (- (3 * kappa * a * m) + 3 * m * a * c).",
               "Proof.", "  intros Hm Ha Hk Hc. assert (0 <= m * a) by (apply Rmult_le_pos; assumption). nra.", "Qed.", ""]
-    J = ["(* the radial jets are derivatives of one another *)",
-         "Ltac side := repeat split; first [ exact I | lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].", ""]
+    L.append("(* the radial jets are derivatives of one another *)")
+    der = {"": "_r", "_r": "_rr", "_u": "_ru"}
     for nm in jetnames:
-        der = {"": "_r", "_r": "_rr", "_u": "_ru"}
         base = nm.rsplit("_", 1)
         suf = "_" + base[1] if len(base) == 2 and base[1] in ("r", "u") else ""
         root = nm[: len(nm) - len(suf)] if suf else nm
         if suf in der and root + der[suf] in jetnames:
-            J += ["Lemma j_%s_derive r : 1 <= r <= 2 -> is_derive j_%s r (j_%s r)." % (nm, nm, root + der[suf]),
-                  "Proof.", "  intros Hr. unfold j_%s, j_%s. auto_derive; [ side | field; side ]." % (nm, root + der[suf]),
+            L += ["Lemma j_%s_derive r : 1 <= r <= 2 -> is_derive j_%s r (j_%s r)." % (nm, nm, root + der[suf]),
+                  "Proof.", "  intros Hr. unfold j_%s, j_%s. auto_derive; [ nonzero | field; nonzero ]." % (nm, root + der[suf]),
                   "Qed.", ""]
-    return L + J + ["End %s." % module, ""]
+    return L + ["End %s." % module, ""], worst_margins(Tab), rows
 
 
-def closed_numeric(family, jets, rho, k1, k2, H0=None, nr=201, nth=81):
-    """Exact margins and certificate rows of a closed-form shell on a grid over the wall."""
-    gen, X = closed_shell(family, jets)
-    comp = ortho_components(family, X, H0)
-    fnum = sp.lambdify((SR, SC, SS), [comp[k] for k in ORTHO], "numpy")
-    rg, thg = np.meshgrid(wall_radii(1.0, 2.0, nr), np.linspace(0.0, np.pi, nth), indexing="ij")
-    vals = [np.broadcast_to(np.asarray(v, dtype=float), rg.shape) for v in fnum(rg, np.cos(thg), np.sin(thg))]
-    c7 = dict(zip(ORTHO, vals))
-    z = np.zeros(rg.shape)
-    E, a, d, S, x, T, P = vals
-    Tab = np.stack([np.stack(row, -1) for row in ([E, a, d, z], [a, S, x, z], [d, x, T, z], [z, z, z, P])], -2)
-    rv = sp.lambdify(SR, rho, "numpy")(rg) + z
-    rows = certificate_rows(c7, float(k1) * rv, float(k2) * rv ** 2)
-    scale = {k: (rv ** 2 if k.startswith("d") else rv) for k in rows}
-    return worst_margins(Tab), {k: float((v / scale[k]).min()) for k, v in rows.items()}
+# The closed-form shells nacelle.v certifies, as `nacelle shells certify` takes them: a drag shell's mass and shift
+# amplitude, and a rocket shell's redshift depth, acceleration, exhaust power over the minimum 3 M a, and multipliers
+# mu = k1 8 pi rho and lam = k2 (8 pi rho)^2.
+CLOSED_SHELLS = {"mass": "3/2", "shift": "1/100", "depth": "1/5", "accel": "1/200", "kappa": "5/4", "k1": "3/4", "k2": "1/2"}
+
+
+def closed_shells(mass, shift, depth, accel, kappa, k1, k2):
+    """The closed-form drag and rocket shells, as the arguments of `certificate_module`, by what certify calls them."""
+    M, b = sp.Rational(mass), sp.Rational(shift)
+    half = sp.Rational(1, 2)
+    drag = dict(module="Drag", family="drag", jets=drag_closed_jets(M, b),
+                rho=closed_shell("drag", drag_closed_jets(M, sp.Integer(0)))[1][(0, 0)], k1=half, k2=half,
+                note="Drag shell on 1 <= r <= 2 with M = %s and shift amplitude %s." % (M, b))
+    dl, a, kap = sp.Rational(depth), sp.Rational(accel), sp.Rational(kappa)
+    jets, Mr = rocket_closed_jets(dl, a, kap)
+    rocket = dict(module="Rocket", family="rocket", jets=jets, rho=sp.cancel(2 * jets["m_r"] / SR ** 2),
+                  k1=sp.Rational(k1), k2=sp.Rational(k2), H0=sp.cancel(1 - 2 * jets["m"] / SR),
+                  note="Rocket shell on 1 <= r <= 2 with E = 1 - %s (2 - r), acceleration %s, exhaust factor %s."
+                  % (dl, a, kap))
+    return {"drag shell M = %s, shift %s" % (M, b): drag,
+            "rocket shell depth %s (M = %s), acceleration %s, kappa %s" % (dl, Mr, a, kap): rocket}
 
 
 FACE_NAMES = {(0, 0): "E", (0, 1): "T0r", (0, 2): "T0th", (1, 1): "Srr", (1, 2): "Srth", (2, 2): "Sthth",
@@ -7352,11 +7194,10 @@ def face_module():
     return L
 
 
-def compile_proofs(rocq, timing=False):
-    """Compile nacelle.v, with every sentence's time when `timing`; returns the exit status, the seconds and the output."""
+def compile_proofs(rocq):
+    """Compile nacelle.v; returns the exit status, the seconds and the output."""
     start = time.time()
-    res = subprocess.run([rocq, "compile", *(["-time"] if timing else []), PROOFS.name],
-                         cwd=PROOFS.parent, capture_output=True, text=True)
+    res = subprocess.run([rocq, "compile", PROOFS.name], cwd=PROOFS.parent, capture_output=True, text=True)
     return res.returncode, time.time() - start, res.stdout + res.stderr
 
 
@@ -7369,32 +7210,16 @@ def cmd_certify(args):
     head = head[: head.index(CERTIFIED)]
     for key, e in face_tensor().items():
         print("face %-6s = %s" % (FACE_NAMES[key], e))
-    M, b = sp.Rational(args.mass), sp.Rational(args.shift)
-    jets = drag_closed_jets(M, b)
-    rho = closed_shell("drag", drag_closed_jets(M, sp.Integer(0)))[1][(0, 0)]
-    k1, k2 = sp.Rational(1, 2), sp.Rational(1, 2)
-    exact, rows = closed_numeric("drag", jets, rho, k1, k2)
-    print("drag shell M = %s, shift %s: exact margins %s" % (M, b, {k: round(v, 3) for k, v in exact.items()}))
-    print("  certificate rows", {k: round(v, 3) for k, v in rows.items()})
     L = [CERTIFIED,
          "   G_* are the components of 8 pi T in terms of the jets of the profile functions, as derived by nacelle",
          "   shells derive and compared with automatic differentiation of the metric by nacelle shells selftest. *)", ""]
     L += CERTIFICATE_LEMMAS.splitlines() + [""]
     L += face_module()
-    L += certificate_module("Drag", "drag", jets, rho, k1, k2,
-                            "Drag shell on 1 <= r <= 2 with M = %s and shift amplitude %s." % (M, b))
-    dl, a, kap = sp.Rational(args.depth), sp.Rational(args.accel), sp.Rational(args.kappa)
-    rj, Mr = rocket_closed_jets(dl, a, kap)
-    rho = sp.cancel(2 * rj["m_r"] / SR ** 2)
-    H0 = sp.cancel(1 - 2 * rj["m"] / SR)
-    k1, k2 = sp.Rational(args.k1), sp.Rational(args.k2)
-    exact, rows = closed_numeric("rocket", rj, rho, k1, k2, H0)
-    print("rocket shell depth %s (M = %s), acceleration %s, kappa %s: exact margins %s" % (
-        dl, Mr, a, kap, {k: round(v, 3) for k, v in exact.items()}))
-    print("  certificate rows", {k: round(v, 3) for k, v in rows.items()})
-    L += certificate_module("Rocket", "rocket", rj, rho, k1, k2,
-                            "Rocket shell on 1 <= r <= 2 with E = 1 - %s (2 - r), acceleration %s, exhaust factor %s."
-                            % (dl, a, kap), H0=H0)
+    for title, shell in closed_shells(**{name: getattr(args, name) for name in CLOSED_SHELLS}).items():
+        lines, exact, rows = certificate_module(**shell)
+        print("%s: exact margins %s" % (title, {k: round(v, 3) for k, v in exact.items()}))
+        print("  certificate rows", {k: round(v, 3) for k, v in rows.items()})
+        L += lines
     with open(PROOFS, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(head + "\n".join(L))
     print("wrote", PROOFS)
@@ -7409,8 +7234,6 @@ def cmd_certify(args):
 
 def cmd_flight(args):
     """Fly the closed-form rocket shell from rest and check every energy condition along the way."""
-    from scipy.integrate import solve_ivp
-    from scipy.optimize import brentq
     kap, d0, alpha, target = args.kappa, args.depth, args.thrust, math.atanh(args.speed)
 
     def mass(dl):
@@ -7424,9 +7247,9 @@ def cmd_flight(args):
             a = alpha * mass(y[0]) * math.sin(math.pi * u / tau) ** 2
             return [-3 * kap * a * mass(y[0]) / dmass(y[0]), a]
 
-        return solve_ivp(rhs, (0.0, tau), [d0, 0.0], rtol=1e-10, atol=1e-13, dense_output=dense)
+        return scipy.integrate.solve_ivp(rhs, (0.0, tau), [d0, 0.0], rtol=1e-10, atol=1e-13, dense_output=dense)
 
-    tau = brentq(lambda t: fly(t).y[1, -1] - target, 1.0, 1e7)
+    tau = scipy.optimize.brentq(lambda t: fly(t).y[1, -1] - target, 1.0, 1e7)
     sol = fly(tau, dense=True)
     tensor = flight_tensor(kap)
     grid = wall_grid(1.0, 2.0, 161, 33)
@@ -7496,23 +7319,26 @@ def cmd_selftest(args):
     good = True
     rng = np.random.default_rng(1)
     R1, R2, M = 1.0, 2.0, 0.3
-    psi = Conformal(R1, R2, M)
+    step = np.array([0.0, 0.0, 0.0, 1.0, 1.0, 1.0])  # from 0 to 1 across the wall, flat to second order at its faces
+    psi = Conformal(R1, R2, M, Bern(R1, R2, M * step))
     r = np.linspace(0.6, 2.6, 41)
     eps = 1e-5
     d1 = (psi(r + eps) - psi(r - eps)) / (2 * eps)
     d2 = (psi(r + eps, 1) - psi(r - eps, 1)) / (2 * eps)
     good &= check("conformal factor derivatives", np.abs(d1 - psi(r, 1)).max() < 1e-8 and np.abs(d2 - psi(r, 2)).max() < 1e-6)
-    good &= check("conformal factor matches Schwarzschild at R2", abs(psi(np.array(R2)) - (1 + M / (2 * R2))) < 1e-14)
+    x, wt = np.polynomial.legendre.leggauss(400)
+    rq = np.linspace(R1, R2, 9)
+    nodes = rq[:, None] + (R2 - rq)[:, None] * (x + 1.0) / 2
+    fine = 1.0 + M / (2 * R2) + (R2 - rq) / 2 * ((psi.q(nodes) / (2 * nodes**2)) * wt).sum(-1)
+    good &= check("conformal factor equals its quadrature on 400 nodes", np.abs(psi(rq) - fine).max() < 1e-14,
+                  "%.1e" % np.abs(psi(rq) - fine).max())
     k = np.arange(15) / 14
-    quad = ConformalQ(R1, R2, M, Step(R1, R2, 0.0, M))
-    good &= check("quadrature conformal factor equals the closed one", np.abs(quad(r) - psi(r)).max() < 1e-13,
-                  "%.1e" % np.abs(quad(r) - psi(r)).max())
     bern = Bern(R1, R2, np.sin(3 * k))
     db = (bern(r + eps) - bern(r - eps)) / (2 * eps)
     inside = (r > R1 + 1e-3) & (r < R2 - 1e-3)
     good &= check("Bernstein derivatives", np.abs(db - bern(r, 1))[inside].max() < 1e-7)
-    zero = Step(R1, R2, 0.0, 0.0)
-    des = DragDesign(R1, R2, M, zero, zero)
+    zero = Bern(R1, R2, np.zeros(3))
+    des = DragDesign(R1, R2, M, zero, zero, psi, zero)
     rw = np.linspace(R1, R2, 201)[1:-1]
     T = des.tensor(rw, 0.3, 0.0)
     p0, p1, p2 = (des.psi(rw, j) for j in range(3))
@@ -7524,7 +7350,7 @@ def cmd_selftest(args):
     good &= check("static shell: rho >= 0 and p_r >= 0", T[:, 0, 0].min() >= 0 and T[:, 1, 1].min() >= -1e-15)
     Tx = des.tensor(np.linspace(R2, 5.0, 30), 0.4, 0.0)
     good &= check("drag exterior is vacuum", np.abs(Tx).max() < 1e-15)
-    sprof = Step(R1, R2, 1.0, 0.0)
+    sprof = Bern(R1, R2, 1.0 - step)
     vals = {"r": rw, "c": np.full_like(rw, 0.3), "s": np.full_like(rw, math.sqrt(1 - 0.09)), "N": np.ones_like(rw),
             "N_r": 0 * rw, "N_rr": 0 * rw, "psi": np.ones_like(rw), "psi_r": 0 * rw, "psi_rr": 0 * rw,
             "b": np.full_like(rw, 0.7), "b_t": 0 * rw}
@@ -7581,17 +7407,11 @@ def cmd_selftest(args):
     th = th + 0.2 * np.abs(th) * rng.uniform(-1, 1, th.size) + 0.02 * rng.uniform(-1, 1, th.size) * (np.arange(th.size) > 2 * dprob.nfree)
     w = ad_check_drag_design(dprob.design(th), 1.0, rng)
     good &= check("drag design tensor equals autodiff curvature of its metric", w < 1e-8, "%.1e" % w)
-    half = sp.Rational(1, 2)
-    jets = drag_closed_jets(sp.Rational(3, 2), sp.Rational(1, 100))
-    rho = closed_shell("drag", drag_closed_jets(sp.Rational(3, 2), sp.Integer(0)))[1][(0, 0)]
-    exact, rows = closed_numeric("drag", jets, rho, half, half)
-    good &= check("closed-form drag shell: conditions and certificate rows", min(exact.values()) > 0 and min(rows.values()) > 0,
-                  "%.3f %.3f" % (min(exact.values()), min(rows.values())))
-    rj, _ = rocket_closed_jets(sp.Rational(1, 5), sp.Rational(1, 200), sp.Rational(5, 4))
-    exact, rows = closed_numeric("rocket", rj, sp.cancel(2 * rj["m_r"] / SR ** 2), sp.Rational(3, 4), half,
-                                 sp.cancel(1 - 2 * rj["m"] / SR))
-    good &= check("closed-form rocket shell: conditions and certificate rows", min(exact.values()) > 0 and min(rows.values()) > 0,
-                  "%.3f %.3f" % (min(exact.values()), min(rows.values())))
+    for shell in closed_shells(**CLOSED_SHELLS).values():
+        _, exact, rows = certificate_module(**shell)
+        good &= check("closed-form %s shell: conditions and certificate rows" % shell["family"],
+                      min(exact.values()) > 0 and min(rows.values()) > 0,
+                      "%.3f %.3f" % (min(exact.values()), min(rows.values())))
     w = ad_check_beam(rng)
     good &= check("beam closed forms equal autodiff curvature", w < 1e-9, "%.1e" % w)
     w = exhaust_check(rng)
@@ -7651,53 +7471,56 @@ def save_rows(name, args, rows):
     save_store(store)
 
 
-def drag_row(d, s, rep, which, t0):
+def search_table(name, args, header, search):
+    """The rows of the result table `name`, after a search for each mass of args.masses it lacks, each row saved as it
+    is found: search(R1, R2, M, which) gives a row, or None when no design is feasible. `header` is printed first."""
+    which = tuple(args.conditions.split(","))
+    R1, R2 = 1.0, 1.0 / args.inner
+    rows = load_rows(name, args)
+    print(header)
+    for M in [float(x) for x in args.masses.split(",") if x]:
+        if any(abs(row["M"] - M) < 1e-12 for row in rows):
+            continue
+        t0 = time.time()
+        row = search(R1, R2, M, which)
+        if row is None:
+            print("%4.2f  no feasible design" % M, flush=True)
+            continue
+        rows.append(dict(row, seconds=time.time() - t0))
+        save_rows(name, args, rows)
+    return which, rows
+
+
+def drag_row(d, s, rep, which):
     """A table row for a verified drag design: its summary, ramp rates and coefficients."""
     ramp = drag_ramp(d, s, which)
     rate = min(min(x[1], x[2]) for x in ramp)
     Rout = d.R2 * (1 + d.M / (2 * d.R2)) ** 2
     accel = rep["psi0"] ** 2 * (rep["b_in"] / s) * rate / rep["N0"] ** 2
     rep.update({"M": d.M, "amplitude": s, "ramp": ramp, "rate": rate, "kick_accel": accel,
-                "kick_accel_scaled": accel * Rout ** 2 / d.M, "design": d.to_dict(), "seconds": time.time() - t0})
+                "kick_accel_scaled": accel * Rout ** 2 / d.M, "design": d.to_dict()})
     return rep
 
 
 def drag_polish(row, source, which):
     """Search again at the mass of `row`, starting from the design of `source` rescaled to that mass."""
-    old, src = row["design"], source["design"]
+    old = row["design"]
     prob = DragProblem(old["R1"], old["R2"], old["M"], free_static=True)
-    k, kq, ratio = prob.k, prob.kq, old["M"] / src["M"]
-    f, h, g, q = (np.asarray(src[key], dtype=float) for key in "fhgq")
-    amp = ratio * source["amplitude"]
-    th0 = np.concatenate([[f[0] * amp], f[k:-k] * amp, h[k:-k] * amp, [g[0]], g[k:-k], q[kq:-kq] * ratio])
-    th, _ = slp(prob, which=which, th0=th0, trust=0.2)
+    th, _ = slp(prob, which=which, th0=design_theta(prob, source["design"], source["amplitude"]), trust=0.2)
     d = prob.design(th)
-    grid = wall_grid(d.R1, d.R2, 401, 65)
-
-    def ok(x):
-        w = d.worst(x, 0.0, grid)
-        return d.timelike(x) and all(w[key] >= -1e-9 for key in which)
-
-    scale = exact_scale(ok)
-    return (d, scale, d.summary(scale, grid)) if scale == scale else None
+    got = drag_scaled(d, which)
+    return None if got is None else (d, *got)
 
 
 def cmd_design(args):
     """Stationary shells: the largest light-time asymmetry under the chosen energy conditions, by mass."""
-    which = tuple(args.conditions.split(","))
-    R1, R2 = 1.0, 1.0 / args.inner
-    rows = load_rows("design", args)
-    print("   M  compact       xi     kick       N0   amp  kick accel x R^2/M  worst margin")
-    for M in [float(x) for x in args.masses.split(",") if x]:
-        if any(abs(row["M"] - M) < 1e-12 for row in rows):
-            continue
-        t0 = time.time()
+
+    def search(R1, R2, M, which):
         got = drag_search(R1, R2, M, which, refine=args.refine, verbose=args.verbose)
-        if got is None:
-            print("%4.2f  no feasible design" % M, flush=True)
-            continue
-        rows.append(drag_row(got[0], got[1], got[2], which, t0))
-        save_rows("design", args, rows)
+        return None if got is None else drag_row(*got, which)
+
+    which, rows = search_table("design", args, "   M  compact       xi     kick       N0   amp  kick accel x R^2/M  "
+                                               "worst margin", search)
     for M in [float(x) for x in args.polish.split(",") if x]:
         rows.sort(key=lambda row: row["M"])
         at = [j for j, row in enumerate(rows) if abs(row["M"] - M) < 1e-12]
@@ -7706,7 +7529,7 @@ def cmd_design(args):
                 t0 = time.time()
                 got = drag_polish(rows[at[0]], rows[j], which)
                 if got is not None and got[2]["xi"] > 1.01 * rows[at[0]]["xi"]:
-                    rows[at[0]] = drag_row(got[0], got[1], got[2], which, t0)
+                    rows[at[0]] = dict(drag_row(*got, which), seconds=time.time() - t0)
                     save_rows("design", args, rows)
     for rep in rows:
         print("%4.2f  %7.4f  %7.5f  %7.5f  %7.4f  %4.2f  %18.4f  %12.4f" % (
@@ -7748,14 +7571,8 @@ def drift_search(R1, R2, M, which, start=None, verbose=False, eps=0.02, deg=None
 
 def cmd_drift(args):
     """Stationary shells: the largest drift of the cavity's free-fall frame relative to the shell, by mass."""
-    which = tuple(args.conditions.split(","))
-    R1, R2 = 1.0, 1.0 / args.inner
-    rows = load_rows("drift", args)
-    print("   M  compact    drift  cavity lapse  ergoregion  worst margin")
-    for M in [float(x) for x in args.masses.split(",") if x]:
-        if any(abs(row["M"] - M) < 1e-12 for row in rows):
-            continue
-        t0 = time.time()
+
+    def search(R1, R2, M, which):
         pool = [row for row in saved_drag_rows(args.inner, which)
                 if (row["design"]["ra"] > R1 + 1e-12) == args.smooth
                 and (args.deg is None or len(row["design"]["f"]) == args.deg + 1)]
@@ -7763,13 +7580,13 @@ def cmd_drift(args):
         got = drift_search(R1, R2, M, which, start=start, verbose=args.verbose, deg=args.deg, smooth=args.smooth,
                            nr=args.nr)
         if got is None:
-            print("%4.2f  no feasible design" % M, flush=True)
-            continue
+            return None
         d, s, rep = got
         rep.update({"M": M, "amplitude": s, "drift": rep["kick"], "ergoregion": bool(rep["kick"] >= 1.0),
-                    "start_M": start["M"] if start else None, "design": d.to_dict(), "seconds": time.time() - t0})
-        rows.append(rep)
-        save_rows("drift", args, rows)
+                    "start_M": start["M"] if start else None, "design": d.to_dict()})
+        return rep
+
+    which, rows = search_table("drift", args, "   M  compact    drift  cavity lapse  ergoregion  worst margin", search)
     for rep in rows:
         print("%4.2f  %7.4f  %7.4f  %12.4f  %10s  %12.4f" % (
             rep["M"], rep["compactness"], rep["drift"], rep["N0"], "yes" if rep["ergoregion"] else "no",
@@ -7778,22 +7595,17 @@ def cmd_drift(args):
 
 def cmd_rocket(args):
     """Accelerating shells with a co-accelerating cavity: the largest acceleration, by mass."""
-    which = tuple(args.conditions.split(","))
-    R1, R2 = 1.0, 1.0 / args.inner
-    rows = load_rows("rocket", args)
-    print("   M  compact   a x R2   a / (M/3R1^2)       E0  worst margin  surface layer")
-    for M in [float(x) for x in args.masses.split(",")]:
-        if any(abs(row["M"] - M) < 1e-12 for row in rows):
-            continue
-        t0 = time.time()
+
+    def search(R1, R2, M, which):
         got = rocket_search(R1, R2, M, which, kappa=args.kappa, drag=args.drag, refine=args.refine, verbose=args.verbose)
         if got is None:
-            print("%4.2f  no feasible design" % M, flush=True)
-            continue
+            return None
         d, rep = got
-        rep.update({"M": M, "layer": d.layer(), "design": d.to_dict(), "seconds": time.time() - t0})
-        rows.append(rep)
-        save_rows("rocket", args, rows)
+        rep.update({"M": M, "layer": d.layer(), "design": d.to_dict()})
+        return rep
+
+    which, rows = search_table("rocket", args, "   M  compact   a x R2   a / (M/3R1^2)       E0  worst margin  "
+                                               "surface layer", search)
     for rep in rows:
         print("%4.2f  %7.4f  %7.5f  %14.4f  %7.4f  %12.4f  %13.1e" % (
             rep["M"], rep["compactness"], rep["aR2"], rep["a_over_newton"], rep["E0"],
@@ -7802,22 +7614,17 @@ def cmd_rocket(args):
 
 def cmd_beam(args):
     """Accelerating hulls with a weightless cavity on the aimed-beam exhaust: the largest acceleration, by mass."""
-    which = tuple(args.conditions.split(","))
-    R1, R2 = 1.0, 1.0 / args.inner
-    rows = load_rows("beam", args)
-    print("   M  compact  a R1^2/M  share of GM/3R1^2  efficiency  worst margin  surface layer")
-    for M in [float(x) for x in args.masses.split(",") if x]:
-        if any(abs(row["M"] - M) < 1e-12 for row in rows):
-            continue
-        t0 = time.time()
+
+    def search(R1, R2, M, which):
         got = beam_search(R1, R2, M, which, kappa=args.kappa, modes=args.modes, verbose=args.verbose)
         if got is None:
-            print("%4.2f  no feasible design" % M, flush=True)
-            continue
+            return None
         prob, th, rep = got
-        rep.update({"M": M, "design": prob.to_dict(th), "seconds": time.time() - t0})
-        rows.append(rep)
-        save_rows("beam", args, rows)
+        rep.update({"M": M, "design": prob.to_dict(th)})
+        return rep
+
+    which, rows = search_table("beam", args, "   M  compact  a R1^2/M  share of GM/3R1^2  efficiency  worst margin  "
+                                             "surface layer", search)
     for rep in rows:
         print("%4.2f  %7.4f  %8.4f  %17.3f  %10.3f  %12.4f  %13.1e" % (
             rep["M"], rep["compactness"], rep["a"] / rep["M"], rep["a_over_newton"], rep["efficiency"],
@@ -7836,80 +7643,9 @@ def cmd_exhaust(args):
     return 0
 
 
-def cmd_timing(args):
-    """Time the kernels: closed forms, tensors and margins, a short optimiser run per family, the checks of a saved
-    design, and with --rocq the Rocq compilation with its slowest sentences."""
-    jax, jnp = _jax()
-
-    def timed(label, fn):
-        t0 = time.time()
-        out = fn()
-        print("%-62s %8.2f s" % (label, time.time() - t0), flush=True)
-        return out
-
-    tables = load_store()["tables"]
-    _FORMS.clear()
-    for fam in ("drag", "rocket", "beam"):
-        timed("compile the %s closed forms (numpy)" % fam, lambda: forms(fam))
-    timed("compile the beam closed forms and hull jets (jax)", lambda: (forms("beam", "jax"), hull_forms()))
-    grid = wall_grid(1.0, 2.0, 401, 65, polar=True)
-    n = grid[0].size
-    row = tables["drift_inner0.50_necwecdecsec"]["rows"][0]
-    d = DragDesign.from_dict(row["design"])
-    T = timed("drag tensor on %d points" % n, lambda: d.tensor(grid[0], grid[1], row["amplitude"]))
-    timed("margins of %d tensors" % n, lambda: worst_margins(T))
-    timed("dual null margin of %d tensors" % n, lambda: nec_dual(T.reshape(-1, 4, 4)))
-    rd = RocketDesign.from_dict(tables["rocket_inner0.50_necwecdecsec"]["rows"][2]["design"])
-    timed("rocket tensor on %d points" % n, lambda: rd.tensor(grid[0], grid[1]))
-    hp = BeamProblem(1.0, 2.0, 0.2, 0.026, exhaust_shape(0.2 * 0.026, 6)[1])
-    th = hp.initial()
-    th[0] = 0.026
-    B = hull_bases(hp, wall_radii(1.0, 2.0, 401), np.cos(np.linspace(np.pi, 0.0, 65)))
-    on = jax.jit(hp.tensor_on)
-    timed("beam tensor on %d points, compiling" % n, lambda: on(jnp.asarray(th), B).block_until_ready())
-    timed("beam tensor on %d points, compiled" % n, lambda: on(jnp.asarray(th) * 1.0001, B).block_until_ready())
-    timed("verify: drag design autodiff check", lambda: ad_check_drag_design(d, row["amplitude"], np.random.default_rng(0)))
-    timed("verify: drag design on 1201 x 193", lambda: chunked_worst(
-        lambda g: d.worst(row["amplitude"], 0.0, g), wall_grid(1.0, 2.0, 1201, 193, polar=True)))
-    timed("verify: rocket design on 1201 x 193", lambda: chunked_worst(rd.worst, wall_grid(1.0, 2.0, 1201, 193, polar=True)))
-    timed("flight: closed-form tensor", lambda: flight_tensor(1.0))
-    for label, prob in (("drag", DragProblem(1.0, 2.0, 1.0, free_static=True, objective="kick")),
-                        ("rocket", RocketProblem(1.0, 2.0, 0.2, free_static=True)), ("beam", hp)):
-        clock, t0 = {}, time.time()
-        slp(prob, iters=args.iters, clock=clock)
-        print("slp %s: %d steps in %.1f s; per phase: calls, first, typical, total" % (
-            label, len(clock.get("jacobian", [])), time.time() - t0))
-        for key in ("rows", "jacobian", "lp", "trial"):
-            v = clock.get(key, [])
-            if v:
-                print("    %-10s %4d  %7.2f s  %7.2f s  %7.1f s" % (key, len(v), v[0], float(np.median(v[1:] or v)), sum(v)))
-    if args.rocq:
-        timed("certify: write the certificates into nacelle.v", lambda: cmd_certify(argparse.Namespace(
-            mass="3/2", shift="1/100", depth="1/5", accel="1/200", kappa="5/4", k1="3/4", k2="1/2", compile=False)))
-        code, seconds, out = compile_proofs(args.rocq_exe, timing=True)
-        print("%-62s %8.2f s  exit %d" % ("rocq compile nacelle.v", seconds, code), flush=True)
-        with open(PROOFS, encoding="utf-8") as fh:
-            text = fh.read()
-        spent = []
-        for line in out.splitlines():
-            if " secs " in line and line.startswith("Chars"):
-                at = int(line.split()[1])
-                lemma = max(text.rfind("Lemma ", 0, at), text.rfind("Theorem ", 0, at))
-                module = text.rfind("Module ", 0, at)
-                where = "%s%s" % (text[module:].split()[1] if module >= 0 else "",
-                                  text[lemma:].split()[1] if lemma >= 0 else "")
-                spent.append((float(line.split(" secs ")[0].split()[-1]), where,
-                              line.split("[")[1].split("]")[0][:50].replace("~", " ")))
-        if code:
-            print(out[-1500:])
-        for sec, where, what in sorted(spent, reverse=True)[:8]:
-            print("    %8.2f s  %-22s %s" % (sec, where, what))
-    return 0
-
-
 def cmd_report(args):
     """Print the result tables, with masses and accelerations for a cavity of the given radius in metres."""
-    G, C = 6.6743e-11, 299792458.0
+    G, C = 6.6743e-11, SPEED_OF_LIGHT
     kg, acc = args.radius * C ** 2 / G, C ** 2 / args.radius
     store = load_store()
     for name, tab in sorted(store["tables"].items()):
@@ -7993,7 +7729,7 @@ def cmd_verify(args):
                 coarse = wall_grid(d.R1, d.R2, 301, 97, polar=True)
                 T = d.tensor(coarse[0], coarse[1])
                 layer = d.layer()
-            dual = float((nec_dual(T)[0] / np.abs(T).max(axis=(-1, -2))).min())
+            dual = float((nec_dual(T)[0] / tensor_size(T)).min())
             m = min(w[k] for k in which)
             ok = ad < 1e-7 and m >= -1e-9 and dual >= -1e-9 and not layer > 1e-9
             good &= ok
@@ -8105,14 +7841,7 @@ def cmd_figure(args):
 
 def _build(args: argparse.Namespace) -> int:
     out = Path(args.out) if args.out else Path("runs") / f"{design_label(args.design)}_res{args.res}"
-    manifest = build(
-        args.design,
-        args.res,
-        out,
-        max_level=args.levels,
-        memory=None if args.memory is None else Memory.of_gib(args.memory),
-        overwrite=args.overwrite,
-    )
+    manifest = build(args.design, args.res, out, max_level=args.levels, memory=_memory(args), overwrite=args.overwrite)
     grid = manifest["grid"]
     print(f"compiled {manifest['design']['name']} into {out}")
     for level, (dx, boxes, cells) in enumerate(zip(grid["dx"], grid["boxes"], grid["cells"])):
@@ -8130,40 +7859,15 @@ def _build(args: argparse.Namespace) -> int:
 
 
 def _fly(args: argparse.Namespace) -> int:
-    record = fly(
-        args.run,
-        exe=args.exe,
-        max_steps=args.steps,
-        threads=args.threads,
-        launcher=args.launcher,
-        stop_time=args.stop_time,
-        max_grid_size=args.max_grid,
-        parameters=tuple(args.set),
-        kernel=args.kernel,
-        deck=args.deck,
-    )
+    record = fly(args.run, max_steps=args.steps, stop_time=args.stop_time, **_flight_settings(args))
     print(json.dumps(record, indent=2))
     return 0 if record["exit_code"] == 0 else 1
 
 
 def _study(args: argparse.Namespace) -> int:
     out = Path(args.out) if args.out else Path("runs") / f"study_{design_label(args.design)}"
-    result = study(
-        args.design,
-        args.res,
-        out,
-        max_level=args.levels,
-        stop_time=args.stop_time,
-        memory=None if args.memory is None else Memory.of_gib(args.memory),
-        overwrite=args.overwrite,
-        exe=args.exe,
-        threads=args.threads,
-        launcher=args.launcher,
-        max_grid_size=args.max_grid,
-        parameters=tuple(args.set),
-        kernel=args.kernel,
-        deck=args.deck,
-    )
+    result = study(args.design, args.res, out, max_level=args.levels, stop_time=args.stop_time, memory=_memory(args),
+                   overwrite=args.overwrite, **_flight_settings(args))
     print(study_table(result))
     return 0
 
@@ -8234,13 +7938,14 @@ def _shells_options(parser: argparse.ArgumentParser) -> None:
             d.add_argument("--modes", type=int, default=6, help="Legendre modes of the wavefront shape, 0 for round")
         d.set_defaults(shells_command=fn)
     d = sub.add_parser("certify", help=cmd_certify.__doc__)
-    d.add_argument("--mass", default="3/2", help="mass of the closed-form drag shell")
-    d.add_argument("--shift", default="1/100", help="shift amplitude of the closed-form drag shell")
-    d.add_argument("--depth", default="1/5", help="redshift depth of the closed-form rocket shell")
-    d.add_argument("--accel", default="1/200", help="acceleration of the closed-form rocket shell")
-    d.add_argument("--kappa", default="5/4", help="exhaust power over the minimum 3 M a")
-    d.add_argument("--k1", default="3/4", help="rocket multiplier mu over 8 pi rho")
-    d.add_argument("--k2", default="1/2", help="rocket multiplier lam over (8 pi rho)^2")
+    for name, what in (("mass", "mass of the closed-form drag shell"),
+                       ("shift", "shift amplitude of the closed-form drag shell"),
+                       ("depth", "redshift depth of the closed-form rocket shell"),
+                       ("accel", "acceleration of the closed-form rocket shell"),
+                       ("kappa", "exhaust power over the minimum 3 M a"),
+                       ("k1", "rocket multiplier mu over 8 pi rho"),
+                       ("k2", "rocket multiplier lam over (8 pi rho)^2")):
+        d.add_argument("--" + name, default=CLOSED_SHELLS[name], help=what)
     d.add_argument("--compile", action="store_true", help="compile nacelle.v once the certificates are written")
     d.add_argument("--rocq", default="rocq", help="path of the rocq executable")
     d.set_defaults(shells_command=cmd_certify)
@@ -8248,11 +7953,6 @@ def _shells_options(parser: argparse.ArgumentParser) -> None:
     d.set_defaults(shells_command=cmd_verify)
     d = sub.add_parser("exhaust", help=cmd_exhaust.__doc__)
     d.set_defaults(shells_command=cmd_exhaust)
-    d = sub.add_parser("timing", help=cmd_timing.__doc__)
-    d.add_argument("--iters", type=int, default=6, help="optimiser steps per family")
-    d.add_argument("--rocq", action="store_true", help="also write the certificates into nacelle.v and compile it")
-    d.add_argument("--rocq-exe", default="rocq", help="path of the rocq executable")
-    d.set_defaults(shells_command=cmd_timing)
     d = sub.add_parser("figure", help=cmd_figure.__doc__)
     d.set_defaults(shells_command=cmd_figure)
     d = sub.add_parser("report", help=cmd_report.__doc__)
@@ -8268,7 +7968,7 @@ def _shells_options(parser: argparse.ArgumentParser) -> None:
 
 
 def _selftest(args: argparse.Namespace) -> int:
-    rows = selftest(None if args.memory is None else Memory.of_gib(args.memory))
+    rows = selftest(_memory(args))
     width = max(len(name) for name, _, _ in rows)
     for name, error, limit in rows:
         print(f"  {name:{width}s}  {error:9.2e}  (allowed {limit:.0e}){'' if error <= limit else '  FAILED'}")
@@ -8295,6 +7995,22 @@ def _flight_options(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _flight_settings(args: argparse.Namespace) -> dict:
+    """The arguments of `fly` that `_flight_options` reads."""
+    return dict(exe=args.exe, threads=args.threads, launcher=args.launcher, max_grid_size=args.max_grid,
+                parameters=tuple(args.set), kernel=args.kernel, deck=args.deck)
+
+
+def _memory_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--memory", type=float, default=None, help="budget for working arrays in GiB; a third of the available memory when omitted"
+    )
+
+
+def _memory(args: argparse.Namespace) -> Memory | None:
+    return None if args.memory is None else Memory.of_gib(args.memory)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="nacelle", description="Spacetime engineering: designed in JAX, flown in GRTeclyn, proved in Rocq."
@@ -8310,9 +8026,7 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--res", type=int, required=True, help="level-0 cells per side of the domain")
     command.add_argument("--levels", type=int, default=None, help="refinement levels; chosen from the thinnest wall when omitted")
     command.add_argument("--out", default=None, help="run directory; runs/<design>_res<res> when omitted")
-    command.add_argument(
-        "--memory", type=float, default=None, help="budget for working arrays in GiB; a third of the available memory when omitted"
-    )
+    _memory_option(command)
     command.add_argument("--overwrite", action="store_true", help="replace the run already in the run directory")
     command.set_defaults(handler=_build)
 
@@ -8329,7 +8043,7 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--levels", type=int, default=None, help="refinement levels of every run; those of the coarsest when omitted")
     command.add_argument("--stop-time", type=float, default=1.0, help="the time every run flies to")
     command.add_argument("--out", default=None, help="directory of the runs; runs/study_<design> when omitted")
-    command.add_argument("--memory", type=float, default=None, help="budget for working arrays in GiB")
+    _memory_option(command)
     command.add_argument("--overwrite", action="store_true", help="replace runs already in the directory")
     _flight_options(command)
     command.set_defaults(handler=_study)
@@ -8356,7 +8070,7 @@ def main(argv: list[str] | None = None) -> int:
     command.set_defaults(handler=_shells)
 
     command = commands.add_parser("selftest", help="check the constraint solver against closed forms")
-    command.add_argument("--memory", type=float, default=None, help="budget for working arrays in GiB")
+    _memory_option(command)
     command.set_defaults(handler=_selftest)
 
     command = commands.add_parser("fetch", help="check out GRTeclyn and AMReX at the commits the flight app builds against")
@@ -8451,101 +8165,16 @@ def _slow(test):
     return pytest.mark.slow(test)
 
 
-def _ring_design(amplitude=0.05):
-    ring = Ring(center=(0.0, 0.0, 0.0), axis=(0.0, 0.0, 1.0), radius=2.0, width=0.75)
-    return Design(parts=(Part(shape=ring, amplitude=amplitude),), domain=Domain(extent=16.0))
-
-
-def _offsets_from(centre, region, h, offset=0.5):
-    """The displacement of every point of a region from a centre, and its length."""
-    axes = [(lo + np.arange(n) + offset) * h - c for lo, n, c in zip(region.lo, region.shape, centre)]
-    d = np.stack(np.meshgrid(*axes, indexing="ij"))
-    return d, np.sqrt(np.sum(d * d, axis=0))
-
-
-def _gaussian_source(region, h, centre, width):
-    """A unit Gaussian sampled on a region, and a function giving its potential on any region of any spacing."""
-    _, r = _offsets_from(centre, region, h)
-    source = np.exp(-(r**2) / (2.0 * width**2)) / ((2.0 * math.pi) ** 1.5 * width**3)
-
-    def exact(target, spacing, offset=0.5):
-        _, r = _offsets_from(centre, target, spacing, offset)
-        return scipy.special.erf(r / (math.sqrt(2.0) * width)) / (4.0 * math.pi * r)
-
-    return source, exact
-
-
-def test_free_space_solve_matches_a_gaussian():
-    h, region = 0.4, Region((0, 0, 0), (40, 40, 40))
-    source, exact = _gaussian_source(region, h, (8.03, 7.98, 8.05), 1.0)
-    computed = np.asarray(coulomb(region, region, h)(jnp.asarray(source)))
-    assert np.max(np.abs(computed - exact(region, h))) < 1e-11
-
-    # the same in chunks under a small budget, half a cell off the centres and far from the source
-    tight = Memory.of_gib(0.04)
-    far = Region((90, -60, 10), (40, 24, 16))
-    for target in (region, far):
-        chunked = evaluate(source, region, target, h, tight, staggered=True)
-        assert np.max(np.abs(chunked - exact(target, h, offset=1.0))) < 1e-11
-
-
-def test_every_level_reads_the_same_potential():
-    """A source on a box of level 1: the values level 0 reads agree with the analytic potential, near and far."""
+def test_the_solver_against_closed_forms():
+    """`nacelle selftest`, and a level refusing to read outside the region its plan keeps."""
     import pytest
 
-    h, fine = 0.25, Region((16, 20, 24), (40, 40, 40))
-    source, exact = _gaussian_source(fine, h, (9.0, 10.0, 11.0), 0.6)
-    read = Region((-24, -24, -24), (56, 56, 56))
-    plan = plan_levels(fine, 1, h, limit=read)
-    field = potential(source, plan, Memory.of_gib(0.25))
-    assert field.sources[0][0].sum() * plan.h[0] ** 3 == pytest.approx(1.0, abs=1e-10)
-    for level, region in ((1, Region((10, 14, 18), (44, 44, 44))), (0, read)):
-        assert np.max(np.abs(field.sample(level, region)[0] - exact(region, plan.h[level]))) < 1e-10
+    failed = [(name, error, limit) for name, error, limit in selftest() if not error <= limit]
+    assert not failed
+    fine, read = Region((16, 20, 24), (40, 40, 40)), Region((-24, -24, -24), (56, 56, 56))
+    field = potential(np.zeros(fine.shape), plan_levels(fine, 1, 0.25, limit=read), Memory.of_gib(0.25))
     with pytest.raises(ValueError, match="outside the region"):
         field.sample(0, read.grow(1))
-
-
-def test_momentum_fields_match_a_gaussian_blob():
-    """The vector potential of a Gaussian momentum blob against its closed form, near and far; the curvature's trace."""
-    h, region, centre = 0.25, Region((0, 0, 0), (56, 56, 56)), (7.03, 6.98, 7.05)
-    momentum, width = np.array([0.3, -0.2, 0.5]), 2.83 * 0.25
-    density, _ = _gaussian_source(region, h, centre, width)
-    sources = [p * density for p in momentum]
-
-    def exact(target):
-        # W_i = -8 pi P_i K + pi d_i (P . grad) M for the potentials K and M of the Gaussian, both functions of r
-        d, r = _offsets_from(centre, target, h)
-        s = math.sqrt(2.0) * width
-        gauss = np.exp(-((r / s) ** 2)) / math.sqrt(math.pi)
-        k = scipy.special.erf(r / s) / (4.0 * math.pi * r)
-        m1 = ((1.0 - 0.5 * (s / r) ** 2) * scipy.special.erf(r / s) + s / r * gauss) / (4.0 * math.pi)
-        m2 = (s**2 / r**3 * scipy.special.erf(r / s) - 2.0 * s / r**2 * gauss) / (4.0 * math.pi)
-        along = np.einsum("i,i...->...", momentum, d) / r
-        return np.stack(
-            [-8.0 * math.pi * p * k + math.pi * (p * m1 / r + d[i] / r * along * (m2 - m1 / r)) for i, p in enumerate(momentum)]
-        )
-
-    for target in (region, Region((150, 20, -30), (16, 16, 16))):
-        fields = evaluate_system(sources, CURVATURE, region, target, h, Memory.of_gib(0.5))
-        reference = exact(target)
-        assert np.max(np.abs(fields[6:] - reference)) < 1e-11 * np.max(np.abs(reference))
-        assert np.max(np.abs(fields[0] + fields[3] + fields[5])) < 1e-11 * np.max(np.abs(fields[:6]))
-
-
-def test_constraint_solve_and_its_gradient():
-    import pytest
-
-    fine = FineGrid(region=Region((0, 0, 0), (24, 24, 24)), h=16.0 / 24, origin=-8.0)
-    kernel = fine.kernel()
-    solution = solve_design(_ring_design(), fine)
-    assert solution.residual < 1e-13 and solution.edge_source < 1e-12
-
-    mass = jax.jit(jax.value_and_grad(lambda amplitude: design_mass(_ring_design(amplitude), fine, kernel)))
-    value, gradient = mass(0.05)
-    assert float(value) == pytest.approx(solution.adm_mass, rel=1e-12)
-    step = 1e-5
-    finite = (float(mass(0.05 + step)[0]) - float(mass(0.05 - step)[0])) / (2.0 * step)
-    assert float(gradient) == pytest.approx(finite, rel=1e-6)
 
 
 def test_least_mass_at_a_given_dragging():
@@ -8587,7 +8216,7 @@ def test_ccz4_conversion_and_multifab_round_trip(tmp_path):
     assert abs(np.trace(np.linalg.inv(h) @ a)) < 1e-12
     assert abs(out["K"] - np.trace(np.linalg.inv(metric) @ curvature)) < 1e-12
 
-    boxes = [Box((0, 0, 0), (7, 7, 7)), Box((8, 0, 0), (15, 7, 3))]
+    boxes = [Region((0, 0, 0), (8, 8, 8)), Region((8, 0, 0), (8, 8, 4))]
     data = [rng.standard_normal((3,) + box.grow(2).shape) for box in boxes]
     write_multifab(tmp_path, "Cell", boxes, 2, 3, lambda i, box: data[i])
     ngrow, stored = read_multifab(tmp_path, "Cell")
@@ -8598,12 +8227,12 @@ def test_ccz4_conversion_and_multifab_round_trip(tmp_path):
 def test_levels_cover_the_walls_and_stay_inside():
     import pytest
 
-    design = _ring_design()
+    design = small_ring()
     hierarchy = place_levels(design, 32, 1)
     refined = np.zeros((64, 64, 64), dtype=bool)
     for box in hierarchy.levels[1]:
-        assert all(lo % 8 == 0 and 8 <= lo and hi < 56 and side <= 32 for lo, hi, side in zip(box.lo, box.hi, box.shape))
-        refined[tuple(slice(lo, hi + 1) for lo, hi in zip(box.lo, box.hi))] = True
+        assert all(lo % 8 == 0 and 8 <= lo and hi <= 56 and side <= 32 for lo, hi, side in zip(box.lo, box.hi, box.shape))
+        refined[tuple(slice(lo, hi) for lo, hi in zip(box.lo, box.hi))] = True
     axis = -8.0 + (np.arange(0, 64, 2) + 0.5) * hierarchy.dx(1)
     x, y, z = np.meshgrid(axis, axis, axis, indexing="ij")
     points = jnp.asarray(np.stack([x.ravel(), y.ravel(), z.ravel()], axis=-1))
@@ -8653,7 +8282,7 @@ def test_a_solid_hull(tmp_path):
 
     # the energy density the solver gave the solid is the one the flight finds in it, and the ring keeps its shape
     assert fly(run, max_steps=2, deck=1, parameters=("deck.cells=16",))["exit_code"] == 0
-    constraints, matter = read_constraints(run), read_diagnostics(run)
+    constraints, matter = read_telemetry(run, "constraints"), read_telemetry(run, "diagnostics")
     assert constraints["ham_linf"][0] < 1e-4
     assert matter["energy"][0] == pytest.approx(manifest["initial_data"]["adm_mass"], rel=2e-2)
     assert matter["energy"][2] == pytest.approx(matter["energy"][0], rel=1e-5)
@@ -8661,7 +8290,7 @@ def test_a_solid_hull(tmp_path):
     assert matter["sz"][2] == pytest.approx(matter["sz"][0], rel=1e-2)
 
     # what a passenger at rest in the cabin feels, from free particles, is the tidal tensor read from the curvature
-    cabin = read_cabin(run)
+    cabin = read_telemetry(run, "cabin")
     last = cabin["step"] == 2
     felt = {axis: cabin[axis][last] for axis in ("ax", "ay", "az")}
     tidal1, tidal3 = cabin["tidal1"][last][0], cabin["tidal3"][last][0]
@@ -8671,8 +8300,8 @@ def test_a_solid_hull(tmp_path):
     scale = max(abs(tidal1), abs(tidal3))
     assert abs((felt["ax"][2] - felt["ax"][1]) / 0.5 - tidal1) < 0.05 * scale
     assert abs((felt["az"][6] - felt["az"][5]) / 0.5 - tidal3) < 0.05 * scale
-    assert np.all(np.isfinite(read_hull(run)["strain"]))
-    waves = read_waves(run)
+    assert np.all(np.isfinite(read_telemetry(run, "hull")["strain"]))
+    waves = read_telemetry(run, "waves")
     assert np.all(np.isfinite(waves["power"])) and np.all(waves["power"] >= 0.0)
     # the flight deck's frames hold the ring, and its server hands a browser the page, the telemetry and the frames
     frames = read_deck(run)["frames"]
@@ -8696,19 +8325,19 @@ def test_a_solid_hull(tmp_path):
 
     # the fused kernel carries the solid as GRTeclyn's passes do, and steps in single precision leave the same flight
     assert fly(run, max_steps=2, kernel="single", parameters=("kernel.check=1",))["exit_code"] == 0
-    check = read_kernel_check(run)
+    check = read_telemetry(run, "kernel")
     assert check["double"].max() < 1e-10 and check["single"].max() < 1e-3
-    single = read_diagnostics(run)
+    single = read_telemetry(run, "diagnostics")
     assert single["energy"][2] == pytest.approx(matter["energy"][2], rel=1e-5)
     assert single["sz"][2] == pytest.approx(matter["sz"][2], rel=1e-5)
 
     # the moving hull: the flight's integral of its momentum density is the solver's momentum, it sets off at its
     # speed, and the fused kernel, which carries the frame of its labels, agrees with GRTeclyn's passes
     assert fly(moving_run, max_steps=2, kernel="double", parameters=("kernel.check=1",))["exit_code"] == 0
-    hull = read_diagnostics(moving_run)
+    hull = read_telemetry(moving_run, "diagnostics")
     assert hull["pz"][0] == pytest.approx(momentum[2], rel=1e-3)
     assert hull["cz"][2] == pytest.approx(0.3 * hull["time"][2], rel=0.2)
-    assert read_kernel_check(moving_run)["double"].max() < 1e-10
+    assert read_telemetry(moving_run, "kernel")["double"].max() < 1e-10
 
 
 def test_an_engine(tmp_path):
@@ -8725,13 +8354,13 @@ def test_an_engine(tmp_path):
     except FileNotFoundError:
         pytest.skip("the flight executable has not been built")
     assert fly(run, max_steps=6, kernel="double", parameters=("kernel.check=2",))["exit_code"] == 0
-    matter, exhaust = read_diagnostics(run), read_exhaust(run)
+    matter, exhaust = read_telemetry(run, "diagnostics"), read_telemetry(run, "exhaust")
     hull = matter["pz"] - exhaust["pz"]
     # the momentum the exhaust carries away is the momentum the hull takes, and the energy is the hull's
     assert exhaust["pz"][-1] < 0.0 < hull[-1]
     assert abs(matter["pz"][-1]) < 0.02 * hull[-1]
     assert exhaust["energy"][-1] > 0.0 and abs(matter["energy"][-1] - matter["energy"][0]) < 0.1 * exhaust["energy"][-1]
-    assert read_kernel_check(run)["double"].max() < 1e-10
+    assert read_telemetry(run, "kernel")["double"].max() < 1e-10
 
 
 def test_a_drive_in_si_units(capsys):
@@ -8792,7 +8421,7 @@ def test_build_then_fly(tmp_path):
     except FileNotFoundError:
         pytest.skip("the flight executable has not been built")
     assert fly(run, max_steps=1)["exit_code"] == 0
-    constraints = read_constraints(run)
+    constraints = read_telemetry(run, "constraints")
     assert constraints["step"].tolist() == [0, 1]
     assert constraints["mom_linf"][0] == 0.0 and constraints["ham_linf"][0] < 1e-3
 
@@ -8803,31 +8432,31 @@ def test_build_then_fly(tmp_path):
         n = 32 * 2**level
         expected = np.full((3, n, n, n), np.nan)
         for box, values in stored:
-            window = tuple(slice(lo, hi + 1) for lo, hi in zip(box.lo, box.hi))
+            window = tuple(slice(lo, hi) for lo, hi in zip(box.lo, box.hi))
             expected[(slice(None),) + window] = values[:, ngrow:-ngrow, ngrow:-ngrow, ngrow:-ngrow]
         for box, values in plot["levels"][level]:
-            window = tuple(slice(lo, hi + 1) for lo, hi in zip(box.lo, box.hi))
+            window = tuple(slice(lo, hi) for lo, hi in zip(box.lo, box.hi))
             for stored_index, name in enumerate(("chi", "lapse", "phi")):
                 assert np.array_equal(values[plot["names"].index(name)], expected[stored_index][window])
 
     # the moving ring: the flight's own integral of the momentum density is the solver's momentum,
     # and the centre of its energy sets off along it
     assert fly(moving_run, max_steps=1, kernel="double", parameters=("kernel.check=1",))["exit_code"] == 0
-    matter = read_diagnostics(moving_run)
+    matter = read_telemetry(moving_run, "diagnostics")
     assert matter["pz"][0] == pytest.approx(momentum[2], rel=0.05)
     assert abs(matter["px"][0]) < 1e-12 and matter["cz"][1] > 0.0
 
     # the fused kernel against GRTeclyn's passes on the same states: to rounding in double, to its digits in single
-    check = read_kernel_check(moving_run)
+    check = read_telemetry(moving_run, "kernel")
     assert check["double"].max() < 1e-10 and check["single"].max() < 1e-3
 
     # the single-precision step leaves the same flight to its digits
-    norms = read_constraints(moving_run)
+    norms = read_telemetry(moving_run, "constraints")
     assert fly(moving_run, max_steps=1, kernel="single")["exit_code"] == 0
-    single = read_diagnostics(moving_run)
+    single = read_telemetry(moving_run, "diagnostics")
     assert single["pz"][1] == pytest.approx(matter["pz"][1], rel=1e-5)
     assert single["energy"][1] == pytest.approx(matter["energy"][1], rel=1e-5)
-    assert read_constraints(moving_run)["ham_l2"][1] == pytest.approx(norms["ham_l2"][1], rel=1e-3)
+    assert read_telemetry(moving_run, "constraints")["ham_l2"][1] == pytest.approx(norms["ham_l2"][1], rel=1e-3)
 
 
 # =============================================================================
@@ -9822,17 +9451,12 @@ __all__ = [
     "BeamProblem",
     "Bench",
     "Bern",
-    "Box",
     "BudgetError",
-    "CABIN_COLUMNS",
-    "CONSTRAINT_COLUMNS",
     "CURVATURE",
     "Cabin",
     "Conformal",
-    "ConformalQ",
     "DEFAULTS",
     "DESTINATIONS",
-    "DIAGNOSTIC_COLUMNS",
     "DRIVES",
     "DeckServer",
     "Design",
@@ -9840,20 +9464,18 @@ __all__ = [
     "DragDesign",
     "DragProblem",
     "Drive",
-    "EXHAUST_COLUMNS",
     "Engine",
     "FarField",
     "FineGrid",
     "FineOperator",
     "Flight",
-    "HULL_COLUMNS",
     "Hierarchy",
     "Jets",
     "KERNELS",
-    "KERNEL_COLUMNS",
     "Kernel",
     "LevelSystem",
     "Memory",
+    "NORMS",
     "Optimum",
     "PINS",
     "POTENTIAL",
@@ -9868,9 +9490,8 @@ __all__ = [
     "Shell",
     "Solid",
     "Solution",
-    "Step",
+    "TELEMETRY",
     "Voyage",
-    "WAVE_COLUMNS",
     "adm_mass",
     "adm_to_ccz4",
     "anderson",
@@ -9918,17 +9539,11 @@ __all__ = [
     "plan_levels",
     "potential",
     "pytree",
-    "read_cabin",
-    "read_constraints",
     "read_deck",
-    "read_diagnostics",
-    "read_exhaust",
     "read_frame",
-    "read_hull",
-    "read_kernel_check",
     "read_multifab",
     "read_plotfile",
-    "read_waves",
+    "read_telemetry",
     "rocket_search",
     "selftest",
     "slp",

@@ -310,33 +310,20 @@ Variables alpha rho16 : F.   (* lapse, and 16 pi rho *)
 Hypothesis hamiltonian :
   four * (alpha * alpha) * rho16 = four * (dv * dv) - symsq.
 
-Lemma Cs_W1 : Cs W1.
+Lemma Cs_W : Cs W1 /\ Cs W2 /\ Cs W3.
 Proof.
-  unfold W1. apply Cs_sub; [apply Cs_mul; assumption |].
-  repeat apply Cs_add; apply Cs_mul; assumption.
-Qed.
-
-Lemma Cs_W2 : Cs W2.
-Proof.
-  unfold W2. apply Cs_sub; [apply Cs_mul; assumption |].
-  repeat apply Cs_add; apply Cs_mul; assumption.
-Qed.
-
-Lemma Cs_W3 : Cs W3.
-Proof.
-  unfold W3. apply Cs_sub; [apply Cs_mul; assumption |].
-  repeat apply Cs_add; apply Cs_mul; assumption.
+  unfold W1, W2, W3. repeat split; apply Cs_sub; repeat apply Cs_add; apply Cs_mul; assumption.
 Qed.
 
 Lemma Cs_divW : Cs divW.
 Proof.
-  unfold divW. repeat apply Cs_add; apply Cs_D;
-    [apply Cs_W1 | apply Cs_W2 | apply Cs_W3].
+  destruct Cs_W as (H1 & H2 & H3).
+  unfold divW. repeat apply Cs_add; apply Cs_D; assumption.
 Qed.
 
 Lemma Int_divW : Int divW = R0.
 Proof.
-  pose proof Cs_W1 as H1. pose proof Cs_W2 as H2. pose proof Cs_W3 as H3.
+  destruct Cs_W as (H1 & H2 & H3).
   unfold divW.
   rewrite Int_add by auto using Cs_add, Cs_D.
   rewrite Int_add by auto using Cs_D.
@@ -344,24 +331,18 @@ Proof.
   lra.
 Qed.
 
-Lemma Cs_c1 : Cs c1.
-Proof. unfold c1. apply Cs_sub; apply Cs_D; assumption. Qed.
-
-Lemma Cs_c2 : Cs c2.
-Proof. unfold c2. apply Cs_sub; apply Cs_D; assumption. Qed.
-
-Lemma Cs_c3 : Cs c3.
-Proof. unfold c3. apply Cs_sub; apply Cs_D; assumption. Qed.
+Lemma Cs_c : Cs c1 /\ Cs c2 /\ Cs c3.
+Proof. unfold c1, c2, c3. repeat split; apply Cs_sub; apply Cs_D; assumption. Qed.
 
 Lemma Cs_curl2 : Cs curl2.
 Proof.
-  unfold curl2. repeat apply Cs_add; apply Cs_mul;
-    [apply Cs_c1 | apply Cs_c2 | apply Cs_c3].
+  destruct Cs_c as (H1 & H2 & H3).
+  unfold curl2. repeat apply Cs_add; apply Cs_mul; assumption.
 Qed.
 
 Lemma Int_curl2_nonneg : Rle R0 (Int curl2).
 Proof.
-  pose proof Cs_c1 as H1. pose proof Cs_c2 as H2. pose proof Cs_c3 as H3.
+  destruct Cs_c as (H1 & H2 & H3).
   unfold curl2.
   rewrite Int_add by auto using Cs_add, Cs_mul.
   rewrite Int_add by auto using Cs_mul.
@@ -398,9 +379,10 @@ End FlatSlicesIntegrated.
         d  x  Th 0
         0  0  0  Ph
 
-   A multiplier mu with T + mu eta diagonally dominant gives the null, weak and strong
-   conditions; a multiplier lam with lam eta - T eta T diagonally dominant gives the
-   dominant condition.  Sylvester's criterion on the same two pencils gives all four. *)
+   A multiplier mu with T + mu eta positive semidefinite gives the null, weak and strong
+   conditions, and with a multiplier lam for which lam eta - T eta T is positive semidefinite
+   the dominant condition.  Diagonal dominance or Sylvester's criterion shows the two pencils
+   semidefinite. *)
 
 Definition Qf (m00 m01 m02 m11 m12 m22 m33 k0 k1 k2 k3 : R) : R :=
   m00*(k0*k0) + m11*(k1*k1) + m22*(k2*k2) + m33*(k3*k3)
@@ -431,10 +413,6 @@ Proof.
   assert (0 <= m33 * (k3*k3)) by (apply Rmult_le_pos; lra).
   nra.
 Qed.
-
-Lemma abs_sum_le p y z :
-  0 <= p - y - z -> 0 <= p - y + z -> 0 <= p + y - z -> 0 <= p + y + z -> Rabs y + Rabs z <= p.
-Proof. intros. unfold Rabs. destruct (Rcase_abs y); destruct (Rcase_abs z); lra. Qed.
 
 (* Sylvester's criterion for the same block form: positive leading minors of the 3x3 block and
    a non-negative 3x3 determinant make the form non-negative. *)
@@ -530,58 +508,8 @@ Lemma flux_norm lam k0 k1 k2 k3 :
   = Qf (D00 lam) D01 D02 (D11 lam) D12 (D22 lam) (D33 lam) k0 k1 k2 k3 - lam * eta k0 k1 k2 k3.
 Proof. unfold w0, w1, w2, w3, Qf, D00, D01, D02, D11, D12, D22, D33, eta. ring. Qed.
 
-Lemma abs_le_of_sq p q : 0 <= q -> p*p <= q*q -> Rabs p <= q.
-Proof. intros Hq H. unfold Rabs. destruct (Rcase_abs p); nra. Qed.
-
-Lemma abs_prod_bound n p q : Rabs p <= q -> - Rabs n * q <= n * p.
-Proof.
-  intros H. assert (0 <= q) by (pose proof (Rabs_pos p); lra).
-  unfold Rabs in *. destruct (Rcase_abs n); destruct (Rcase_abs p); nra.
-Qed.
-
-(* dominant condition: the flux is causal and future-directed for every future causal k *)
-Theorem dominant_condition lam : psd_lam lam -> 0 <= lam -> Rabs a + Rabs d <= E ->
-  forall k0 k1 k2 k3, 0 <= k0 -> eta k0 k1 k2 k3 <= 0 ->
-  0 <= w0 k0 k1 k2 k3 /\
-  w1 k0 k1 k2 k3 * w1 k0 k1 k2 k3 + w2 k0 k1 k2 k3 * w2 k0 k1 k2 k3 + w3 k0 k1 k2 k3 * w3 k0 k1 k2 k3
-    <= w0 k0 k1 k2 k3 * w0 k0 k1 k2 k3.
-Proof.
-  intros H Hl Hd k0 k1 k2 k3 Hk0 Hk. split.
-  - unfold eta in Hk.
-    assert (Rabs k1 <= k0) as A1 by (apply abs_le_of_sq; nra).
-    assert (Rabs k2 <= k0) as A2 by (apply abs_le_of_sq; nra).
-    pose proof (abs_prod_bound a k1 k0 A1). pose proof (abs_prod_bound d k2 k0 A2).
-    unfold w0. nra.
-  - pose proof (flux_norm lam k0 k1 k2 k3) as F. specialize (H k0 k1 k2 k3). nra.
-Qed.
-
-(* the four conditions from the two diagonally dominant pencils *)
-Theorem certified mu lam :
-  Rabs a + Rabs d <= E - mu -> Rabs a + Rabs x <= Sr + mu -> Rabs d + Rabs x <= Th + mu -> 0 <= Ph + mu ->
-  0 <= mu -> 0 <= mu + trace / 2 ->
-  Rabs D01 + Rabs D02 <= D00 lam -> Rabs D01 + Rabs D12 <= D11 lam -> Rabs D02 + Rabs D12 <= D22 lam ->
-  0 <= D33 lam -> 0 <= lam ->
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 = 0 -> 0 <= Tq k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 -> 0 <= Tq k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 -> 0 <= Tq k0 k1 k2 k3 - trace / 2 * eta k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, 0 <= k0 -> eta k0 k1 k2 k3 <= 0 ->
-     0 <= w0 k0 k1 k2 k3 /\
-     w1 k0 k1 k2 k3 * w1 k0 k1 k2 k3 + w2 k0 k1 k2 k3 * w2 k0 k1 k2 k3 + w3 k0 k1 k2 k3 * w3 k0 k1 k2 k3
-       <= w0 k0 k1 k2 k3 * w0 k0 k1 k2 k3).
-Proof.
-  intros N0 N1 N2 N3 Hm Hs L0 L1 L2 L3 Hl.
-  assert (psd_mu mu) as Pm by (unfold psd_mu; apply dominant_nonneg; assumption).
-  assert (psd_lam lam) as Pl by (unfold psd_lam; apply dominant_nonneg; assumption).
-  repeat split.
-  - apply (null_condition mu Pm).
-  - apply (weak_condition mu Pm Hm).
-  - apply (strong_condition mu Pm Hs).
-  - apply (dominant_condition lam Pl Hl); [lra | assumption | assumption].
-  - apply (dominant_condition lam Pl Hl); [lra | assumption | assumption].
-Qed.
-
-(* the dominant condition from the two pencils alone, without a bound on |a| + |d| *)
-Theorem dominant_condition2 mu lam : psd_mu mu -> 0 <= mu -> psd_lam lam -> 0 <= lam ->
+(* the dominant condition: the flux is causal and future-directed for every future causal k *)
+Theorem dominant_condition mu lam : psd_mu mu -> 0 <= mu -> psd_lam lam -> 0 <= lam ->
   forall k0 k1 k2 k3, 0 <= k0 -> eta k0 k1 k2 k3 <= 0 ->
   0 <= w0 k0 k1 k2 k3 /\
   w1 k0 k1 k2 k3 * w1 k0 k1 k2 k3 + w2 k0 k1 k2 k3 * w2 k0 k1 k2 k3 + w3 k0 k1 k2 k3 * w3 k0 k1 k2 k3
@@ -608,24 +536,8 @@ Proof.
   - pose proof (flux_norm lam k0 k1 k2 k3) as F. specialize (Pl k0 k1 k2 k3). nra.
 Qed.
 
-(* the null and weak conditions from Sylvester's criterion on T + mu eta *)
-Theorem certified_null_weak mu :
-  0 <= mu -> 0 < E - mu -> 0 < minor2 (E - mu) a (Sr + mu) ->
-  0 <= det3 (E - mu) a d (Sr + mu) x (Th + mu) -> 0 <= Ph + mu ->
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 = 0 -> 0 <= Tq k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 -> 0 <= Tq k0 k1 k2 k3).
-Proof.
-  intros Hm S0 S1 S2 S3.
-  assert (psd_mu mu) as Pm by (unfold psd_mu; apply sylvester_nonneg; assumption).
-  split; [apply (null_condition mu Pm) | apply (weak_condition mu Pm Hm)].
-Qed.
-
-(* the four conditions from Sylvester's criterion on both pencils *)
-Theorem certified_sylvester mu lam :
-  0 <= mu -> 0 < E - mu -> 0 < minor2 (E - mu) a (Sr + mu) ->
-  0 <= det3 (E - mu) a d (Sr + mu) x (Th + mu) -> 0 <= Ph + mu -> 0 <= mu + trace / 2 ->
-  0 <= lam -> 0 < D00 lam -> 0 < minor2 (D00 lam) D01 (D11 lam) ->
-  0 <= det3 (D00 lam) D01 D02 (D11 lam) D12 (D22 lam) -> 0 <= D33 lam ->
+(* the null, weak, strong and dominant conditions, for every observer *)
+Definition energy_conditions : Prop :=
   (forall k0 k1 k2 k3, eta k0 k1 k2 k3 = 0 -> 0 <= Tq k0 k1 k2 k3) /\
   (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 -> 0 <= Tq k0 k1 k2 k3) /\
   (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 -> 0 <= Tq k0 k1 k2 k3 - trace / 2 * eta k0 k1 k2 k3) /\
@@ -633,16 +545,39 @@ Theorem certified_sylvester mu lam :
      0 <= w0 k0 k1 k2 k3 /\
      w1 k0 k1 k2 k3 * w1 k0 k1 k2 k3 + w2 k0 k1 k2 k3 * w2 k0 k1 k2 k3 + w3 k0 k1 k2 k3 * w3 k0 k1 k2 k3
        <= w0 k0 k1 k2 k3 * w0 k0 k1 k2 k3).
+
+(* the four conditions from the two pencils, positive semidefinite *)
+Theorem pencil_conditions mu lam :
+  psd_mu mu -> 0 <= mu -> 0 <= mu + trace / 2 -> psd_lam lam -> 0 <= lam -> energy_conditions.
 Proof.
-  intros Hm S0 S1 S2 S3 Hs Hl L0 L1 L2 L3.
-  assert (psd_mu mu) as Pm by (unfold psd_mu; apply sylvester_nonneg; assumption).
-  assert (psd_lam lam) as Pl by (unfold psd_lam; apply sylvester_nonneg; assumption).
-  repeat split.
+  intros Pm Hm Hs Pl Hl. unfold energy_conditions. repeat split.
   - apply (null_condition mu Pm).
   - apply (weak_condition mu Pm Hm).
   - apply (strong_condition mu Pm Hs).
-  - intros. apply (dominant_condition2 mu lam Pm Hm Pl Hl); assumption.
-  - intros. apply (dominant_condition2 mu lam Pm Hm Pl Hl); assumption.
+  - intros. apply (dominant_condition mu lam Pm Hm Pl Hl); assumption.
+  - intros. apply (dominant_condition mu lam Pm Hm Pl Hl); assumption.
+Qed.
+
+(* the four conditions from the two pencils, diagonally dominant *)
+Theorem certified mu lam :
+  Rabs a + Rabs d <= E - mu -> Rabs a + Rabs x <= Sr + mu -> Rabs d + Rabs x <= Th + mu -> 0 <= Ph + mu ->
+  0 <= mu -> 0 <= mu + trace / 2 ->
+  Rabs D01 + Rabs D02 <= D00 lam -> Rabs D01 + Rabs D12 <= D11 lam -> Rabs D02 + Rabs D12 <= D22 lam ->
+  0 <= D33 lam -> 0 <= lam -> energy_conditions.
+Proof.
+  intros N0 N1 N2 N3 Hm Hs L0 L1 L2 L3 Hl.
+  apply (pencil_conditions mu lam); try assumption; unfold psd_mu, psd_lam; apply dominant_nonneg; assumption.
+Qed.
+
+(* the four conditions from Sylvester's criterion on both pencils *)
+Theorem certified_sylvester mu lam :
+  0 <= mu -> 0 < E - mu -> 0 < minor2 (E - mu) a (Sr + mu) ->
+  0 <= det3 (E - mu) a d (Sr + mu) x (Th + mu) -> 0 <= Ph + mu -> 0 <= mu + trace / 2 ->
+  0 <= lam -> 0 < D00 lam -> 0 < minor2 (D00 lam) D01 (D11 lam) ->
+  0 <= det3 (D00 lam) D01 D02 (D11 lam) D12 (D22 lam) -> 0 <= D33 lam -> energy_conditions.
+Proof.
+  intros Hm S0 S1 S2 S3 Hs Hl L0 L1 L2 L3.
+  apply (pencil_conditions mu lam); try assumption; unfold psd_mu, psd_lam; apply sylvester_nonneg; assumption.
 Qed.
 
 End Certificates.
@@ -651,22 +586,10 @@ End Certificates.
    G_* are the components of 8 pi T in terms of the jets of the profile functions, as derived by nacelle
    shells derive and compared with automatic differentiation of the metric by nacelle shells selftest. *)
 
-(* Interval's bisection on the tree of an expression.  The rows of the certificates below are proved with it:
-   nacelle shells certify writes each row's tree, which Interval's tactic would build by reification, and the
-   kernel runs the bisection once, at Qed, on its virtual machine. *)
-Lemma tree_bound e vars hyps g prec depth idx :
-  match Prog.extract e (length vars) with
-  | Prog.Eabort => false
-  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect prec depth idx hyps lp lc g
-  end = true ->
-  Reify.eval_hyps hyps vars (Reify.eval_goal g (Tree.eval e vars)).
-Proof.
-  intros H. generalize (Prog.extract_correct e vars).
-  destruct (Prog.extract e (length vars)) as [|lp lc]; [discriminate |].
-  intros <-. exact (Private.IT2.IH.eval_bisect_correct prec depth idx vars hyps lp lc g H).
-Qed.
-
-(* the wall 1 <= r <= 2, -1 <= c <= 1, cut in r and in c to a depth of 40, and the goal 0 <= e *)
+(* Interval's bisection on the tree of an expression e, over the wall 1 <= r <= 2, -1 <= c <= 1 cut in r and in c
+   to a depth of 40, for the goal 0 <= e.  The rows of the certificates below are proved with it: nacelle shells
+   certify writes each row's tree, which Interval's tactic would build by reification, and the kernel runs the
+   bisection once, at Qed, on its virtual machine. *)
 Definition wall_hyps : list (list Reify.hyp) :=
   ((Reify.Hlele true true (Tree.Econst (Tree.Int 1)) (Tree.Econst (Tree.Int 2)) :: nil)
    :: (Reify.Hlele true true (Tree.Econst (Tree.Int (-1))) (Tree.Econst (Tree.Int 1)) :: nil) :: nil)%list.
@@ -682,8 +605,11 @@ Definition wall_check (e : Tree.expr) : bool :=
 Lemma wall_nonneg e : wall_check e = true ->
   forall r c, 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= Tree.eval e (r :: c :: nil).
 Proof.
-  intros H r c.
-  exact (tree_bound e (r :: c :: nil)%list wall_hyps wall_goal 53%Z 40 (0%nat :: 1%nat :: nil)%list H).
+  intros H r c. generalize (Prog.extract_correct e (r :: c :: nil)%list).
+  change (length (r :: c :: nil)%list) with 2%nat. unfold wall_check in H.
+  destruct (Prog.extract e 2) as [|lp lc]; [discriminate |].
+  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 1%nat :: nil)%list (r :: c :: nil)%list
+                      wall_hyps lp lc wall_goal H).
 Qed.
 
 Ltac wall e r c :=
@@ -723,7 +649,7 @@ Proof.
   cbn. ring.
 Qed.
 
-Ltac nonzero := repeat split; first [ lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
+Ltac nonzero := repeat split; first [ exact I | lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
 
 Ltac identity r c s fe1 fe2 :=
   let N := fresh in
@@ -961,15 +887,7 @@ Lemma row_l r c : 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= lam r.
 Proof. wall (Tree.Ebinary Tree.Mul (Tree.Ebinary Tree.Div (Tree.Econst (Tree.Int 1)) (Tree.Econst (Tree.Int 2))) (Tree.Eunary Tree.Sqr tree_rho)) r c. Qed.
 
 (* every energy condition, for every observer, at every point of the wall *)
-Theorem shell_energy_conditions r c : 1 <= r <= 2 -> -1 <= c <= 1 ->
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 = 0 -> 0 <= Tq (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c) k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 -> 0 <= Tq (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c) k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 ->
-     0 <= Tq (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c) k0 k1 k2 k3 - trace (tE r c) (tS r c) (tT r c) (tP r c) / 2 * eta k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, 0 <= k0 -> eta k0 k1 k2 k3 <= 0 ->
-     0 <= w0 (tE r c) (ta r c) (td r c) k0 k1 k2 k3 /\
-     w1 (ta r c) (tS r c) (tx r c) k0 k1 k2 k3 * (w1 (ta r c) (tS r c) (tx r c) k0 k1 k2 k3) + w2 (td r c) (tx r c) (tT r c) k0 k1 k2 k3 * (w2 (td r c) (tx r c) (tT r c) k0 k1 k2 k3) + w3 (tP r c) k0 k1 k2 k3 * (w3 (tP r c) k0 k1 k2 k3)
-       <= w0 (tE r c) (ta r c) (td r c) k0 k1 k2 k3 * (w0 (tE r c) (ta r c) (td r c) k0 k1 k2 k3)).
+Theorem shell_energy_conditions r c : 1 <= r <= 2 -> -1 <= c <= 1 -> energy_conditions (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c).
 Proof.
   intros Hr Hc.
   apply (certified (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c) (mu r) (lam r)).
@@ -987,46 +905,44 @@ Proof.
 Qed.
 
 (* the radial jets are derivatives of one another *)
-Ltac side := repeat split; first [ exact I | lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
-
 Lemma j_N_derive r : 1 <= r <= 2 -> is_derive j_N r (j_N_r r).
 Proof.
-  intros Hr. unfold j_N, j_N_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_N, j_N_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_N_r_derive r : 1 <= r <= 2 -> is_derive j_N_r r (j_N_rr r).
 Proof.
-  intros Hr. unfold j_N_r, j_N_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_N_r, j_N_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_psi_derive r : 1 <= r <= 2 -> is_derive j_psi r (j_psi_r r).
 Proof.
-  intros Hr. unfold j_psi, j_psi_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_psi, j_psi_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_psi_r_derive r : 1 <= r <= 2 -> is_derive j_psi_r r (j_psi_rr r).
 Proof.
-  intros Hr. unfold j_psi_r, j_psi_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_psi_r, j_psi_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_f_derive r : 1 <= r <= 2 -> is_derive j_f r (j_f_r r).
 Proof.
-  intros Hr. unfold j_f, j_f_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_f, j_f_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_f_r_derive r : 1 <= r <= 2 -> is_derive j_f_r r (j_f_rr r).
 Proof.
-  intros Hr. unfold j_f_r, j_f_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_f_r, j_f_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_h_derive r : 1 <= r <= 2 -> is_derive j_h r (j_h_r r).
 Proof.
-  intros Hr. unfold j_h, j_h_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_h, j_h_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_h_r_derive r : 1 <= r <= 2 -> is_derive j_h_r r (j_h_rr r).
 Proof.
-  intros Hr. unfold j_h_r, j_h_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_h_r, j_h_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 End Drag.
@@ -1226,15 +1142,7 @@ Lemma row_l r c : 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= lam r.
 Proof. wall (Tree.Ebinary Tree.Mul (Tree.Ebinary Tree.Div (Tree.Econst (Tree.Int 1)) (Tree.Econst (Tree.Int 2))) (Tree.Eunary Tree.Sqr tree_rho)) r c. Qed.
 
 (* every energy condition, for every observer, at every point of the wall *)
-Theorem shell_energy_conditions r c : 1 <= r <= 2 -> -1 <= c <= 1 ->
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 = 0 -> 0 <= Tq (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c) k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 -> 0 <= Tq (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c) k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, eta k0 k1 k2 k3 <= 0 ->
-     0 <= Tq (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c) k0 k1 k2 k3 - trace (tE r c) (tS r c) (tT r c) (tP r c) / 2 * eta k0 k1 k2 k3) /\
-  (forall k0 k1 k2 k3, 0 <= k0 -> eta k0 k1 k2 k3 <= 0 ->
-     0 <= w0 (tE r c) (ta r c) (td r c) k0 k1 k2 k3 /\
-     w1 (ta r c) (tS r c) (tx r c) k0 k1 k2 k3 * (w1 (ta r c) (tS r c) (tx r c) k0 k1 k2 k3) + w2 (td r c) (tx r c) (tT r c) k0 k1 k2 k3 * (w2 (td r c) (tx r c) (tT r c) k0 k1 k2 k3) + w3 (tP r c) k0 k1 k2 k3 * (w3 (tP r c) k0 k1 k2 k3)
-       <= w0 (tE r c) (ta r c) (td r c) k0 k1 k2 k3 * (w0 (tE r c) (ta r c) (td r c) k0 k1 k2 k3)).
+Theorem shell_energy_conditions r c : 1 <= r <= 2 -> -1 <= c <= 1 -> energy_conditions (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c).
 Proof.
   intros Hr Hc.
   apply (certified (tE r c) (ta r c) (td r c) (tS r c) (tx r c) (tT r c) (tP r c) (mu r) (lam r)).
@@ -1260,81 +1168,79 @@ Proof.
 Qed.
 
 (* the radial jets are derivatives of one another *)
-Ltac side := repeat split; first [ exact I | lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
-
 Lemma j_E_derive r : 1 <= r <= 2 -> is_derive j_E r (j_E_r r).
 Proof.
-  intros Hr. unfold j_E, j_E_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_E, j_E_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_E_r_derive r : 1 <= r <= 2 -> is_derive j_E_r r (j_E_rr r).
 Proof.
-  intros Hr. unfold j_E_r, j_E_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_E_r, j_E_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_E_u_derive r : 1 <= r <= 2 -> is_derive j_E_u r (j_E_ru r).
 Proof.
-  intros Hr. unfold j_E_u, j_E_ru. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_E_u, j_E_ru. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_e_derive r : 1 <= r <= 2 -> is_derive j_e r (j_e_r r).
 Proof.
-  intros Hr. unfold j_e, j_e_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_e, j_e_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_e_r_derive r : 1 <= r <= 2 -> is_derive j_e_r r (j_e_rr r).
 Proof.
-  intros Hr. unfold j_e_r, j_e_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_e_r, j_e_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_e_u_derive r : 1 <= r <= 2 -> is_derive j_e_u r (j_e_ru r).
 Proof.
-  intros Hr. unfold j_e_u, j_e_ru. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_e_u, j_e_ru. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_m_derive r : 1 <= r <= 2 -> is_derive j_m r (j_m_r r).
 Proof.
-  intros Hr. unfold j_m, j_m_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_m, j_m_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_m_r_derive r : 1 <= r <= 2 -> is_derive j_m_r r (j_m_rr r).
 Proof.
-  intros Hr. unfold j_m_r, j_m_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_m_r, j_m_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_m_u_derive r : 1 <= r <= 2 -> is_derive j_m_u r (j_m_ru r).
 Proof.
-  intros Hr. unfold j_m_u, j_m_ru. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_m_u, j_m_ru. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_W_derive r : 1 <= r <= 2 -> is_derive j_W r (j_W_r r).
 Proof.
-  intros Hr. unfold j_W, j_W_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_W, j_W_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_W_r_derive r : 1 <= r <= 2 -> is_derive j_W_r r (j_W_rr r).
 Proof.
-  intros Hr. unfold j_W_r, j_W_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_W_r, j_W_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_W_u_derive r : 1 <= r <= 2 -> is_derive j_W_u r (j_W_ru r).
 Proof.
-  intros Hr. unfold j_W_u, j_W_ru. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_W_u, j_W_ru. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_U_derive r : 1 <= r <= 2 -> is_derive j_U r (j_U_r r).
 Proof.
-  intros Hr. unfold j_U, j_U_r. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_U, j_U_r. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_U_r_derive r : 1 <= r <= 2 -> is_derive j_U_r r (j_U_rr r).
 Proof.
-  intros Hr. unfold j_U_r, j_U_rr. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_U_r, j_U_rr. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 Lemma j_U_u_derive r : 1 <= r <= 2 -> is_derive j_U_u r (j_U_ru r).
 Proof.
-  intros Hr. unfold j_U_u, j_U_ru. auto_derive; [ side | field; side ].
+  intros Hr. unfold j_U_u, j_U_ru. auto_derive; [ nonzero | field; nonzero ].
 Qed.
 
 End Rocket.
