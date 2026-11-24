@@ -1,0 +1,16 @@
+__pycache__/
+*.egg-info/
+.pytest_cache/
+runs/
+external/
+flight/tmp_build_dir/
+flight/*.ex
+flight/parameters_and_version.txt
+cache/
+*.vo
+*.vok
+*.vos
+*.glob
+.*.aux
+.nra.cache
+.lia.cache
