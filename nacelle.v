@@ -599,7 +599,7 @@ Definition wall_goal : Reify.gol := Reify.Gge true (Tree.Econst (Tree.Int 0)).
 Definition wall_check (e : Tree.expr) : bool :=
   match Prog.extract e 2 with
   | Prog.Eabort => false
-  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect 53%Z 40 (0%nat :: 1%nat :: nil)%list wall_hyps lp lc wall_goal
+  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect 53%Z 40 (0%nat :: 0%nat :: 1%nat :: nil)%list wall_hyps lp lc wall_goal
   end.
 
 Lemma wall_nonneg e : wall_check e = true ->
@@ -608,7 +608,7 @@ Proof.
   intros H r c. generalize (Prog.extract_correct e (r :: c :: nil)%list).
   change (length (r :: c :: nil)%list) with 2%nat. unfold wall_check in H.
   destruct (Prog.extract e 2) as [|lp lc]; [discriminate |].
-  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 1%nat :: nil)%list (r :: c :: nil)%list
+  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 0%nat :: 1%nat :: nil)%list (r :: c :: nil)%list
                       wall_hyps lp lc wall_goal H).
 Qed.
 

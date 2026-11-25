@@ -6881,7 +6881,7 @@ Definition wall_goal : Reify.gol := Reify.Gge true (Tree.Econst (Tree.Int 0)).
 Definition wall_check (e : Tree.expr) : bool :=
   match Prog.extract e 2 with
   | Prog.Eabort => false
-  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect 53%Z 40 (0%nat :: 1%nat :: nil)%list wall_hyps lp lc wall_goal
+  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect 53%Z 40 (0%nat :: 0%nat :: 1%nat :: nil)%list wall_hyps lp lc wall_goal
   end.
 
 Lemma wall_nonneg e : wall_check e = true ->
@@ -6890,7 +6890,7 @@ Proof.
   intros H r c. generalize (Prog.extract_correct e (r :: c :: nil)%list).
   change (length (r :: c :: nil)%list) with 2%nat. unfold wall_check in H.
   destruct (Prog.extract e 2) as [|lp lc]; [discriminate |].
-  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 1%nat :: nil)%list (r :: c :: nil)%list
+  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 0%nat :: 1%nat :: nil)%list (r :: c :: nil)%list
                       wall_hyps lp lc wall_goal H).
 Qed.
 
@@ -8495,6 +8495,19 @@ def test_build_then_fly(tmp_path):
     assert single["pz"][1] == pytest.approx(matter["pz"][1], rel=1e-5)
     assert single["energy"][1] == pytest.approx(matter["energy"][1], rel=1e-5)
     assert read_telemetry(moving_run, "constraints")["ham_l2"][1] == pytest.approx(norms["ham_l2"][1], rel=1e-3)
+
+
+def test_the_deck_pages_script_parses(tmp_path):
+    """The flight deck's script parses as an ES module, by `node --check`; skipped where Node.js is not installed."""
+    import pytest
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node.js is not installed")
+    script = tmp_path / "deck.mjs"
+    script.write_text(DECK_PAGE.split('<script type="module">', 1)[1].split("</script>", 1)[0], encoding="utf-8")
+    checked = subprocess.run([node, "--check", str(script)], capture_output=True, text=True)
+    assert checked.returncode == 0, checked.stderr
 
 
 # =============================================================================
