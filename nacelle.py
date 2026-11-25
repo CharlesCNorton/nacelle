@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import errno
+import functools
 import gzip
 import hashlib
 import http.server
@@ -6726,24 +6727,32 @@ SECTION_FORMS = {
     "D33": ("Ph lam", "lam - Ph*Ph"),
     "trace": ("E Sr Th Ph", "- E + Sr + Th + Ph"),
 }
-# Each definition applied to a certificate's components tE ... tP, its section's variables E a d Sr x Th Ph, and to lam.
-_SECTION_ARGUMENTS = dict(zip("E a d Sr x Th Ph".split(), ("(t%s r th)" % k for k in ORTHO)), lam="(lam r)")
-SECTION_APPLIED = {name: " ".join([name] + [_SECTION_ARGUMENTS[p] for p in params.split()])
-                   for name, (params, _) in SECTION_FORMS.items()}
+# The section's variables E a d Sr x Th Ph that a certificate's definitions take, as its components tE ... tP.
+_SECTION_ARGUMENTS = dict(zip("E a d Sr x Th Ph".split(), ("(t%s r th)" % k for k in ORTHO)))
+
+
+def section_applied(mu, lam):
+    """Each definition of SECTION_FORMS applied to a certificate's components and to its multiplier lam, and the
+    multipliers mu and lam themselves, Rocq terms, by the names the rows use."""
+    args = dict(_SECTION_ARGUMENTS, lam="(%s)" % lam)
+    out = {name: " ".join([name] + [args[p] for p in params.split()]) for name, (params, _) in SECTION_FORMS.items()}
+    return dict(out, mu=mu, lam=lam)
+
+
 # What `certified` requires to be non-negative, in the order of its hypotheses: diagonal dominance of T + mu eta with
 # mu >= 0 and the strong condition's bound on mu, then that of lam eta - T eta T with lam >= 0.
 CERTIFICATE_ROWS = (
-    ("n0", "tE r th - mu r - Rabs (ta r th) - Rabs (td r th)"),
-    ("n1", "tS r th + mu r - Rabs (ta r th) - Rabs (tx r th)"),
-    ("n2", "tT r th + mu r - Rabs (td r th) - Rabs (tx r th)"),
-    ("n3", "tP r th + mu r"),
-    ("m", "mu r"),
-    ("s", "mu r + {trace} / 2"),
+    ("n0", "tE r th - {mu} - Rabs (ta r th) - Rabs (td r th)"),
+    ("n1", "tS r th + {mu} - Rabs (ta r th) - Rabs (tx r th)"),
+    ("n2", "tT r th + {mu} - Rabs (td r th) - Rabs (tx r th)"),
+    ("n3", "tP r th + {mu}"),
+    ("m", "{mu}"),
+    ("s", "{mu} + {trace} / 2"),
     ("d0", "{D00} - Rabs ({D01}) - Rabs ({D02})"),
     ("d1", "{D11} - Rabs ({D01}) - Rabs ({D12})"),
     ("d2", "{D22} - Rabs ({D02}) - Rabs ({D12})"),
     ("d3", "{D33}"),
-    ("l", "lam r"),
+    ("l", "{lam}"),
 )
 WALL = (("var", 0), ("var", 1))  # the trees of r and of the polar angle th on the wall
 TREE_FUNCTIONS = {"Rabs": "Abs", "sqrt": "Sqrt", "cos": "Cos", "sin": "Sin"}  # Rocq's functions, by Interval's name
@@ -6859,54 +6868,572 @@ TREE_BINARY = {"Add": np.add, "Sub": np.subtract, "Mul": np.multiply, "Div": np.
 # What the certificates' rows are proved with: Interval's bisection, which its tactic runs on the trees it reifies, run
 # here on the trees that `term_tree` writes, and checked once, by the kernel at Qed.
 CERTIFICATE_LEMMAS = """\
-(* Interval's bisection on the tree of an expression e, over the wall 1 <= r <= 2, 0 <= th <= PI cut twice in r for
-   each cut in th to a depth of 40, for the goal 0 <= e.  The rows of the certificates below are proved with it:
-   nacelle shells certify writes each row's tree, which Interval's tactic would build by reification, and the kernel
-   runs the bisection once, at Qed, on its virtual machine. *)
+From Stdlib Require Import List Lia Bool.
+
+(* The certificates' rows are proved by bisection on the trees that Interval's tactic would build by reification:
+   nacelle shells certify writes them, and the kernel runs the bisection once, at Qed, on its virtual machine, over
+   the wall 1 <= r <= 2, 0 <= th <= PI, for the goal 0 <= row. *)
 Definition wall_hyps : list (list Reify.hyp) :=
   ((Reify.Hlele true true (Tree.Econst (Tree.Int 1)) (Tree.Econst (Tree.Int 2)) :: nil)
    :: (Reify.Hlele true true (Tree.Econst (Tree.Int 0)) (Tree.Econst Tree.Pi) :: nil) :: nil)%list.
 
 Definition wall_goal : Reify.gol := Reify.Gge true (Tree.Econst (Tree.Int 0)).
 
-Definition wall_check (e : Tree.expr) : bool :=
-  match Prog.extract e 2 with
-  | Prog.Eabort => false
-  | Prog.Eprog lp lc => Private.IT2.IH.eval_bisect 53%Z 40 (0%nat :: 0%nat :: 1%nat :: nil)%list wall_hyps lp lc wall_goal
-  end.
+(* The two-level bisection, which proves the shells' rows, whose components are radial functions times powers of
+   cos th and sin th.  The radial functions, the outputs of a program in r alone, are enclosed once on each cell of
+   r; the rows, the outputs of one program in th, r and the radial functions, are enclosed together on each piece of
+   a bisection in th with the radial functions held to their enclosures.  Each enclosure, of either level, comes from
+   one pass of its program with its derivative in the variable cut: the naive one met with the mean-value form
+   f(m) + (xi - m) f'(xi) about the piece's middle m.  A piece is cut in two for the rows that fail on it, and a cell
+   for the rows that fail on some piece at the full depth. *)
+Lemma radial_nai x : Interval.contains (Private.I2.convert Private.I2.nai) x.
+Proof. rewrite Private.I2.nai_correct. exact I. Qed.
 
-Lemma wall_nonneg e : wall_check e = true ->
-  forall r th, 1 <= r <= 2 -> 0 <= th <= PI -> 0 <= Tree.eval e (r :: th :: nil).
+Lemma radial_consts l : Private.IT2.IH.A.contains_all (map (Private.IT2.IH.T.eval_bnd 53%Z) l)
+  (map (fun c => Tree.eval c nil) l).
 Proof.
-  intros H r th. generalize (Prog.extract_correct e (r :: th :: nil)%list).
-  change (length (r :: th :: nil)%list) with 2%nat. unfold wall_check in H.
-  destruct (Prog.extract e 2) as [|lp lc]; [discriminate |].
-  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 0%nat :: 1%nat :: nil)%list (r :: th :: nil)%list
-                      wall_hyps lp lc wall_goal H).
+  induction l as [| c l IH].
+  - split; [reflexivity |]. intros n. destruct n; apply radial_nai.
+  - apply Private.IT2.IH.A.contains_all_cons; [exact IH | apply Private.IT2.IH.T.eval_bnd_correct].
 Qed.
 
-Ltac wall e r th :=
-  let H := fresh in
-  assert (H : wall_check e = true) by vm_cast_no_check (eq_refl true);
-  exact_no_check (wall_nonneg e H r th).
+Lemma radial_app l1 x1 l2 x2 : Private.IT2.IH.A.contains_all l1 x1 -> Private.IT2.IH.A.contains_all l2 x2 ->
+  Private.IT2.IH.A.contains_all (l1 ++ l2) (x1 ++ x2).
+Proof.
+  intros [L1 H1] [L2 H2]. split; [rewrite !length_app; lia |].
+  intros n. destruct (Nat.lt_ge_cases n (length l1)) as [Hn | Hn].
+  - rewrite !app_nth1 by lia. apply H1.
+  - rewrite !app_nth2 by lia. rewrite L1. apply H2.
+Qed.
+
+Lemma radial_nth {A : Type} (f : nat -> A) d n m : (n < m)%nat -> nth n (map f (seq 0 m)) d = f n.
+Proof.
+  intros Hn. rewrite (nth_indep _ d (f 0%nat)) by (rewrite length_map, length_seq; lia).
+  rewrite map_nth, seq_nth by lia. reflexivity.
+Qed.
+
+Lemma radial_map_nth {A B : Type} (f : A -> B) l d d' n : (n < length l)%nat -> nth n (map f l) d' = f (nth n l d).
+Proof. intros Hn. rewrite (nth_indep _ d' (f d)) by (rewrite length_map; exact Hn). apply map_nth. Qed.
+
+(* enclosures of the outputs of a program over a piece of its first variable, its other inputs held to bounds rest *)
+Definition box_bounds (ap : list Prog.term) (rest : list Private.I2.type) (na : nat) (ti : Private.I2.type) :
+    list Private.I2.type :=
+  let d := Prog.eval_generic (Private.IT2.IH.A.DiffValuator.diff_operations _
+             (Private.IT2.IH.A.BndValuator.operations 53%Z)) ap
+             ((ti, Private.I2.mask (Private.I2.fromZ_small 1) ti)
+              :: map (fun b => (b, Private.I2.mask Private.I2.zero ti)) rest) in
+  let mi := Private.IT2.IH.A.J.midpoint ti in
+  let vm := Private.IT2.IH.A.BndValuator.eval 53%Z ap (mi :: rest) in
+  map (fun k => let yy := nth k d (Private.I2.nai, Private.I2.nai) in
+                Private.I2.meet (fst yy) (Private.I2.add 53%Z (nth k vm Private.I2.nai)
+                  (Private.I2.mul 53%Z (Private.I2.sub 53%Z ti mi) (snd yy))))
+      (seq 0 na).
+
+Lemma box_bounds_correct ap rest na ti vs t : Private.IT2.IH.A.contains_all rest vs ->
+  Interval.contains (Private.I2.convert ti) (Xreal.Xreal t) -> forall k, (k < na)%nat ->
+  Interval.contains (Private.I2.convert (nth k (box_bounds ap rest na ti) Private.I2.nai))
+    (Xreal.Xreal (nth k (Prog.eval_real ap (t :: vs)) 0)).
+Proof.
+  intros Hc Ht k Hk. unfold box_bounds. cbv zeta. rewrite radial_nth by exact Hk. cbv beta.
+  pose (f := fun x => nth k (Eval.eval_ext ap (x :: map Xreal.Xreal vs)) Xreal.Xnan).
+  pose (f' := fun x : Xreal.ExtendedR => snd (nth k (Prog.eval_generic
+     (Private.IT2.IH.A.DiffValuator.diff_operations Xreal.ExtendedR Eval.ext_operations) ap
+     ((x, Xreal.Xmask (Xreal.Xreal 1) x) :: map (fun v : R => (Xreal.Xreal v, Xreal.Xmask (Xreal.Xreal 0) x)) vs))
+     (Xreal.Xnan, Xreal.Xnan))).
+  destruct (Private.IT2.IH.A.DiffValuator.eval_diff_bnd_correct 53%Z ap _ _ Hc k ti) as [H1 H2].
+  assert (Hd : Xreal_derive.Xderive f f')
+    by (intros x; exact (proj2 (Private.IT2.IH.A.DiffValuator.eval_diff_correct ap _ k x))).
+  assert (Hne : Interval.not_empty (Private.I2.convert ti)) by (exists t; exact Ht).
+  destruct (Private.I2.midpoint_correct ti Hne) as [Hm1 Hm2].
+  pose (m := Xreal.proj_val (Private.I2.F.toX (Private.I2.midpoint ti))).
+  assert (Hmi : Interval.contains (Private.I2.convert (Private.IT2.IH.A.J.midpoint ti)) (Xreal.Xreal m)).
+  { rewrite (Private.IT2.IH.A.J.midpoint_correct ti Hne). simpl. split; apply Rle_refl. }
+  assert (Hmri : Interval.contains (Private.I2.convert ti) (Xreal.Xreal m)) by (unfold m; rewrite <- Hm1; exact Hm2).
+  assert (Hext := Private.IT2.IH.A.BndValuator.eval_correct_ext 53%Z ap _ _ Hc k).
+  match goal with |- Interval.contains (Private.I2.convert ?E) _ => set (enc := E) end.
+  apply (Eval.xreal_to_real (fun y => Interval.contains (Private.I2.convert enc) y)
+           (fun v => Interval.contains (Private.I2.convert enc) (Xreal.Xreal v)));
+    [ intros HX v; destruct (Private.I2.convert enc); [exact I | destruct HX] | intros v Hv; exact Hv |].
+  unfold enc. apply Private.I2.meet_correct.
+  - rewrite <- H1. exact (Hext ti (Xreal.Xreal t) Ht).
+  - exact (Private.IT2.IH.A.DiffValuator.diff_refining_aux_1 53%Z f f' ti _ m _ _ Hd Hmi Hmri
+             (Hext _ (Xreal.Xreal m) Hmi) H2 (Xreal.Xreal t) Ht).
+Qed.
+
+(* the radial functions, the outputs of a program ap in r with constants ac, and their enclosures on a cell *)
+Definition radial_values (ap : list Prog.term) (ac : list Tree.expr) (na : nat) (r : R) : list R :=
+  let v := Prog.eval_real ap (r :: map (fun c => Tree.eval c nil) ac) in
+  map (fun k => nth k v 0) (seq 0 na).
+
+Definition radial_bounds (ap : list Prog.term) (ac : list Tree.expr) (na : nat) (ri : Private.I2.type) :
+    list Private.I2.type :=
+  box_bounds ap (map (Private.IT2.IH.T.eval_bnd 53%Z) ac) na ri.
+
+Lemma radial_bounds_correct ap ac na ri r : Interval.contains (Private.I2.convert ri) (Xreal.Xreal r) ->
+  Private.IT2.IH.A.contains_all (radial_bounds ap ac na ri) (radial_values ap ac na r).
+Proof.
+  intros Hr. split; [unfold radial_bounds, box_bounds, radial_values; rewrite !length_map; reflexivity |].
+  intros n. destruct (Nat.lt_ge_cases n na) as [Hn | Hn].
+  - unfold radial_values. rewrite radial_nth by exact Hn.
+    exact (box_bounds_correct ap _ na ri _ r (radial_consts ac) Hr n Hn).
+  - unfold radial_bounds, box_bounds, radial_values.
+    rewrite !nth_overflow by (rewrite length_map, length_seq; lia). apply radial_nai.
+Qed.
+
+(* a bisection in th that stops at the first piece that fails *)
+Fixpoint theta_ok (depth : nat) (check : Private.I2.type -> bool) (ti : Private.I2.type) {struct depth} : bool :=
+  if check ti then true else
+  match depth with
+  | O => false
+  | S d => if theta_ok d check (fst (Private.I2.bisect ti)) then theta_ok d check (snd (Private.I2.bisect ti))
+           else false
+  end.
+
+Lemma theta_ok_correct depth check (P : R -> Prop) ti t :
+  (forall xi x, Interval.contains (Private.I2.convert xi) (Xreal.Xreal x) -> check xi = true -> P x) ->
+  theta_ok depth check ti = true -> Interval.contains (Private.I2.convert ti) (Xreal.Xreal t) -> P t.
+Proof.
+  intros Hcheck. revert ti. induction depth as [| d IH]; intros ti H Ht; simpl in H;
+    (destruct (check ti) eqn:Hc; [exact (Hcheck ti t Ht Hc) |]); [discriminate |].
+  destruct (theta_ok d check (fst (Private.I2.bisect ti))) eqn:H1; [| discriminate].
+  destruct (Private.I2.bisect_correct ti (Xreal.Xreal t) Ht) as [Ht' | Ht'].
+  - exact (IH _ H1 Ht').
+  - exact (IH _ H Ht').
+Qed.
+
+(* a row, a program in th, then r, the radial functions and its constants, checked on the pieces of th by its
+   enclosure with its derivative in th, the radial functions held to their enclosures rest *)
+Definition row_on (depth : nat) (row : list Prog.term * list Tree.expr) (rest : list Private.I2.type)
+    (thi : Private.I2.type) : bool :=
+  let rb := rest ++ map (Private.IT2.IH.T.eval_bnd 53%Z) (snd row) in
+  theta_ok depth (fun ti => Private.IT2.IH.R.eval_goal_bnd 53%Z wall_goal
+                              (Private.IT2.IH.A.DiffValuator.eval 53%Z (fst row) rb 0 ti)) thi.
+
+Lemma row_on_correct depth row rest thi vs th : row_on depth row rest thi = true ->
+  Private.IT2.IH.A.contains_all rest vs -> Interval.contains (Private.I2.convert thi) (Xreal.Xreal th) ->
+  Reify.eval_goal wall_goal (nth 0 (Prog.eval_real (fst row) (th :: vs ++ map (fun c => Tree.eval c nil) (snd row))) 0).
+Proof.
+  intros H Hc Hth. unfold row_on in H. cbv zeta in H.
+  refine (theta_ok_correct depth _ (fun t => Reify.eval_goal wall_goal (nth 0 (Prog.eval_real (fst row)
+            (t :: vs ++ map (fun c => Tree.eval c nil) (snd row))) 0)) thi th _ H Hth).
+  intros xi x Hx Hk.
+  exact (Private.IT2.IH.R.eval_goal_bnd_correct 53%Z wall_goal _ _
+           (Private.IT2.IH.A.DiffValuator.eval_correct 53%Z (fst row) _ _
+              (radial_app _ _ _ _ Hc (radial_consts (snd row))) 0 xi x Hx) Hk).
+Qed.
+
+(* on each cell of r the radial functions are enclosed once, every row is checked by the bisection in th with them
+   held there, and the cell is cut in two for the rows that fail *)
+Fixpoint radial_cells (outer depth : nat) (ap : list Prog.term) (ac : list Tree.expr) (na : nat)
+    (rows : list (list Prog.term * list Tree.expr)) (ri thi : Private.I2.type) {struct outer} : bool :=
+  let rest := ri :: radial_bounds ap ac na ri in
+  match filter (fun row => negb (row_on depth row rest thi)) rows with
+  | nil => true
+  | bad => match outer with
+           | O => false
+           | S o => radial_cells o depth ap ac na bad (fst (Private.I2.bisect ri)) thi
+                    && radial_cells o depth ap ac na bad (snd (Private.I2.bisect ri)) thi
+           end
+  end.
+
+Lemma radial_cells_correct outer depth ap ac na rows ri thi : radial_cells outer depth ap ac na rows ri thi = true ->
+  forall r th, Interval.contains (Private.I2.convert ri) (Xreal.Xreal r) ->
+  Interval.contains (Private.I2.convert thi) (Xreal.Xreal th) -> forall row, In row rows ->
+  Reify.eval_goal wall_goal (nth 0 (Prog.eval_real (fst row)
+    (th :: (r :: radial_values ap ac na r) ++ map (fun c => Tree.eval c nil) (snd row))) 0).
+Proof.
+  revert rows ri. induction outer as [| o IH]; intros rows ri H r th Hr Hth row Hrow; simpl in H; cbv zeta in H;
+    (assert (Hc : Private.IT2.IH.A.contains_all (ri :: radial_bounds ap ac na ri) (r :: radial_values ap ac na r))
+       by (apply Private.IT2.IH.A.contains_all_cons; [apply radial_bounds_correct, Hr | exact Hr]));
+    (destruct (row_on depth row (ri :: radial_bounds ap ac na ri) thi) eqn:Ro;
+     [exact (row_on_correct depth row _ thi _ th Ro Hc Hth) |]);
+    assert (Hin : In row (filter (fun row => negb (row_on depth row (ri :: radial_bounds ap ac na ri) thi)) rows))
+      by (apply filter_In; split; [exact Hrow | rewrite Ro; reflexivity]);
+    (destruct (filter (fun row => negb (row_on depth row (ri :: radial_bounds ap ac na ri) thi)) rows) as [| p l];
+     [contradiction |]).
+  - discriminate.
+  - apply andb_true_iff in H as [H1 H2].
+    destruct (Private.I2.bisect_correct ri (Xreal.Xreal r) Hr) as [Hr' | Hr'].
+    + exact (IH _ _ H1 r th Hr' Hth row Hin).
+    + exact (IH _ _ H2 r th Hr' Hth row Hin).
+Qed.
+
+Definition radial_row (na : nat) (e : Tree.expr) : list Prog.term * list Tree.expr :=
+  match Prog.extract e (2 + na) with Prog.Eabort => (nil, nil) | Prog.Eprog lp lc => (lp, lc) end.
+
+(* a program run on trees gives the tree of each value it computes, so that a program written out in full is shown
+   to compute given trees by comparing them *)
+Definition tree_ops : Prog.operations Tree.expr :=
+  Prog.Build_operations (fun z => Tree.Econst (Tree.Int z)) (Tree.Econst (Tree.Int 0))
+    (fun o x => Tree.Eunary o x) (fun o x y => Tree.Ebinary o x y) (fun _ => Xreal.Xund).
+
+Lemma prog_trees ap ac vars : forallb (fun c => Prog.max_arity c 0) ac = true -> forall n,
+  nth n (Prog.eval_real ap (vars ++ map (fun c => Tree.eval c nil) ac)) 0 =
+  Tree.eval (nth n (Prog.eval_generic tree_ops ap (map Tree.Evar (seq 0 (length vars)) ++ ac))
+               (Tree.Econst (Tree.Int 0))) vars.
+Proof.
+  intros Hc n.
+  apply (Prog.eval_inductive_prop R Tree.expr (fun a b => a = Tree.eval b vars) Prog.real_operations tree_ops).
+  - intros o a b ->. reflexivity.
+  - intros o a1 a2 b1 b2 -> ->. reflexivity.
+  - intros j. destruct (Nat.lt_ge_cases j (length vars)) as [Hj | Hj].
+    + rewrite app_nth1 by exact Hj. rewrite app_nth1 by (rewrite length_map, length_seq; exact Hj).
+      rewrite (radial_map_nth Tree.Evar (seq 0 (length vars)) 0%nat) by (rewrite length_seq; exact Hj).
+      rewrite seq_nth by exact Hj. reflexivity.
+    + rewrite app_nth2 by exact Hj. rewrite app_nth2 by (rewrite length_map, length_seq; exact Hj).
+      rewrite length_map, length_seq.
+      destruct (Nat.lt_ge_cases (j - length vars) (length ac)) as [Hj' | Hj'].
+      * rewrite (radial_map_nth (fun c => Tree.eval c nil) ac (Tree.Econst (Tree.Int 0))) by exact Hj'.
+        symmetry. apply (Prog.max_arity_correct (nth (j - length vars) ac (Tree.Econst (Tree.Int 0))) nil vars).
+        apply (proj1 (forallb_forall _ ac) Hc). apply nth_In. exact Hj'.
+      * rewrite !nth_overflow by (try rewrite length_map; lia). reflexivity.
+Qed.
+
+(* the check: the program ap with constants ac computes the radial functions ae, and every row of re holds *)
+Definition radial_check (outer depth : nat) (ap : list Prog.term) (ac ae re : list Tree.expr) : bool :=
+  forallb (fun c => Prog.max_arity c 0) ac
+  && forallb (fun k => Prog.expr_beq (nth k (Prog.eval_generic tree_ops ap (map Tree.Evar (seq 0 1) ++ ac))
+                                        (Tree.Econst (Tree.Int 0))) (nth k ae (Tree.Econst (Tree.Int 0))))
+       (seq 0 (length ae))
+  && forallb (fun e => match Prog.extract e (2 + length ae) with Prog.Eabort => false | Prog.Eprog _ _ => true end) re
+  && radial_cells outer depth ap ac (length ae) (map (radial_row (length ae)) re)
+       (nth 0 (Private.IT2.IH.R.merge_hyps 53%Z wall_hyps) Private.I2.nai)
+       (nth 1 (Private.IT2.IH.R.merge_hyps 53%Z wall_hyps) Private.I2.nai).
+
+Lemma radial_wall r th : 1 <= r <= 2 -> 0 <= th <= PI ->
+  Interval.contains (Private.I2.convert (nth 0 (Private.IT2.IH.R.merge_hyps 53%Z wall_hyps) Private.I2.nai)) (Xreal.Xreal r) /\\
+  Interval.contains (Private.I2.convert (nth 1 (Private.IT2.IH.R.merge_hyps 53%Z wall_hyps) Private.I2.nai)) (Xreal.Xreal th).
+Proof.
+  intros Hr Hth.
+  refine (Private.IT2.IH.R.eval_hyps_bnd_correct 53%Z wall_hyps (r :: th :: nil)%list _ _ Hr Hth).
+  destruct (Private.IT2.IH.R.merge_hyps 53%Z wall_hyps) as [| ri [| thi l]]; simpl; tauto.
+Qed.
+
+Lemma radial_nonneg outer depth ap ac ae re : radial_check outer depth ap ac ae re = true ->
+  forall r th, 1 <= r <= 2 -> 0 <= th <= PI -> forall k, (k < length re)%nat ->
+  0 <= Tree.eval (nth k re (Tree.Econst (Tree.Int 0))) (th :: r :: map (fun e => Tree.eval e (r :: nil)) ae).
+Proof.
+  intros H r th Hr Hth k Hk. unfold radial_check in H.
+  apply andb_true_iff in H as [H Hcells]. apply andb_true_iff in H as [H Hall].
+  apply andb_true_iff in H as [Hc Heq].
+  destruct (radial_wall r th Hr Hth) as [Hri Hthi].
+  assert (Hvals : radial_values ap ac (length ae) r = map (fun e => Tree.eval e (r :: nil)) ae).
+  { unfold radial_values.
+    apply nth_ext with (d := 0) (d' := 0); [rewrite !length_map, length_seq; reflexivity |].
+    intros n Hn. rewrite length_map, length_seq in Hn.
+    rewrite (radial_nth (fun k => nth k (Prog.eval_real ap (r :: map (fun c => Tree.eval c nil) ac)) 0)) by exact Hn.
+    rewrite (radial_map_nth (fun e => Tree.eval e (r :: nil)) ae (Tree.Econst (Tree.Int 0))) by exact Hn.
+    pose proof (prog_trees ap ac (r :: nil) Hc n) as HP. cbn [app length] in HP. rewrite HP.
+    f_equal. apply Prog.internal_expr_dec_bl.
+    apply (proj1 (forallb_forall _ (seq 0 (length ae))) Heq). apply in_seq. lia. }
+  set (e := nth k re (Tree.Econst (Tree.Int 0))).
+  assert (Hin : In (radial_row (length ae) e) (map (radial_row (length ae)) re))
+    by (apply in_map; apply nth_In; exact Hk).
+  generalize (Prog.extract_correct e (th :: r :: map (fun e => Tree.eval e (r :: nil)) ae)%list).
+  replace (length (th :: r :: map (fun e => Tree.eval e (r :: nil)) ae)%list) with (2 + length ae)%nat
+    by (simpl; rewrite length_map; reflexivity).
+  assert (He : match Prog.extract e (2 + length ae) with Prog.Eabort => false | Prog.Eprog _ _ => true end = true)
+    by (apply (proj1 (forallb_forall _ re) Hall); apply nth_In; exact Hk).
+  unfold radial_row in Hin.
+  destruct (Prog.extract e (2 + length ae)) as [| lp lc]; [discriminate |]. intros <-.
+  generalize (radial_cells_correct _ _ _ _ _ _ _ _ Hcells r th Hri Hthi _ Hin). rewrite Hvals. exact (fun h => h).
+Qed.
+
+From Stdlib Require ZArith PArray Uint63 ZifyUint63.
+
+(* Interval's programs name an earlier value by its depth in the list of values, so that each step walks down the list
+   to its arguments.  The same programs, with those depths as machine integers and run on a persistent array that
+   holds each value at its own index, reach each argument in one step and compute the same values; the check below
+   runs them so, with the constants of the radial program and of each row enclosed once.  The module keeps the names
+   of the machine integers and arrays, such as their sqrt, to itself. *)
+Module Fast.
+Import ZArith PArray Uint63 ZifyUint63.
+
+Inductive fterm : Type :=
+| FForward (u : int) | FUnary (o : Tree.unary_op) (u : int) | FBinary (o : Tree.binary_op) (u v : int).
+
+(* a depth as a machine integer, those past the array's largest length all read as one *)
+Definition int_of_nat (n : nat) : int :=
+  let z := Z.of_nat n in if (z <? 4194304)%Z then of_Z z else 4194303%uint63.
+
+Definition fconv (t : Prog.term) : fterm :=
+  match t with
+  | Prog.Forward u => FForward (int_of_nat u)
+  | Prog.Unary o u => FUnary o (int_of_nat u)
+  | Prog.Binary o u v => FBinary o (int_of_nat u) (int_of_nat v)
+  end.
+
+Lemma int_of_nat_small n : (Z.of_nat n < 4194304)%Z -> to_Z (int_of_nat n) = Z.of_nat n.
+Proof.
+  intros H. unfold int_of_nat. cbv zeta. destruct (Z.ltb_spec (Z.of_nat n) 4194304); [| lia].
+  rewrite of_Z_spec. apply Z.mod_small. unfold wB, size. simpl. lia.
+Qed.
+
+Lemma int_of_nat_large n : (4194304 <= Z.of_nat n)%Z -> to_Z (int_of_nat n) = 4194303%Z.
+Proof.
+  intros H. unfold int_of_nat. cbv zeta. destruct (Z.ltb_spec (Z.of_nat n) 4194304); [lia |]. reflexivity.
+Qed.
+
+Lemma length_bound {A : Type} (t : array A) : (to_Z (PArray.length t) <= 4194303)%Z.
+Proof. pose proof (leb_length A t) as H. apply leb_spec in H. exact H. Qed.
+
+Section Fast.
+Context {A : Type} (ops : Prog.operations A).
+
+Definition fget (arr : array A) (base u : int) : A :=
+  if (u <? base)%uint63 then arr.[base - 1 - u] else Prog.unknown ops.
+
+Definition fpush (st : array A * int) (x : A) : array A * int := ((fst st).[snd st <- x], (snd st + 1)%uint63).
+
+Definition fstep (st : array A * int) (t : fterm) : array A * int :=
+  fpush st (match t with
+            | FForward u => fget (fst st) (snd st) u
+            | FUnary o u => Prog.unary ops o (fget (fst st) (snd st) u)
+            | FBinary o u v => Prog.binary ops o (fget (fst st) (snd st) u) (fget (fst st) (snd st) v)
+            end).
+
+(* the run of a program on inputs xs, or Interval's own where the array would be too long *)
+Definition frun (prog : list Prog.term) (fp : list fterm) (xs : list A) : (array A * int) + list A :=
+  let n := (List.length xs + List.length fp)%nat in
+  if (Z.of_nat n <=? 4194303)%Z then
+    inl (fold_left fstep fp (fold_left fpush (rev xs) (make (int_of_nat n) (Prog.unknown ops), 0%uint63)))
+  else inr (Prog.eval_generic ops prog xs).
+
+Definition fres (res : (array A * int) + list A) (k : nat) : A :=
+  match res with inl st => fget (fst st) (snd st) (int_of_nat k) | inr l => nth k l (Prog.unknown ops) end.
+
+(* a state holds the list s when its base is the length of s and its array has the list's k-th value at base - 1 - k *)
+Definition holds (st : array A * int) (s : list A) : Prop :=
+  to_Z (snd st) = Z.of_nat (List.length s) /\\ (to_Z (snd st) <= to_Z (PArray.length (fst st)))%Z /\\
+  forall i, (to_Z i < to_Z (snd st))%Z ->
+    (fst st).[i] = nth (Z.to_nat (to_Z (snd st) - 1 - to_Z i)) s (Prog.unknown ops).
+
+Lemma holds_push st s x : holds st s -> (to_Z (snd st) < to_Z (PArray.length (fst st)))%Z ->
+  holds (fpush st x) (x :: s) /\\ PArray.length (fst (fpush st x)) = PArray.length (fst st).
+Proof.
+  intros [Hb [Hle Hi]] Hl. unfold fpush. cbn [fst snd]. rewrite length_set.
+  pose proof (length_bound (fst st)) as B. pose proof (to_Z_bounded (snd st)) as Bs.
+  assert (Hb' : to_Z (snd st + 1)%uint63 = (to_Z (snd st) + 1)%Z) by lia.
+  split; [| reflexivity]. unfold holds; cbn [fst snd].
+  split; [rewrite Hb', Hb; cbn [List.length]; lia |]. split; [rewrite length_set, Hb'; lia |].
+  intros i Hi'. rewrite Hb' in Hi'. destruct (Z.eq_dec (to_Z i) (to_Z (snd st))) as [E | E].
+  - apply to_Z_inj in E. subst i. rewrite get_set_same by (apply ltb_spec; exact Hl).
+    rewrite Hb'. replace (to_Z (snd st) + 1 - 1 - to_Z (snd st))%Z with 0%Z by lia. reflexivity.
+  - rewrite get_set_other by (intros H'; apply E; rewrite H'; reflexivity). rewrite Hi by lia. rewrite Hb'.
+    replace (Z.to_nat (to_Z (snd st) + 1 - 1 - to_Z i)) with (S (Z.to_nat (to_Z (snd st) - 1 - to_Z i))) by lia.
+    reflexivity.
+Qed.
+
+Lemma holds_get st s u : holds st s -> fget (fst st) (snd st) (int_of_nat u) = nth u s (Prog.unknown ops).
+Proof.
+  intros [Hb [Hle Hi]]. unfold fget. pose proof (length_bound (fst st)) as B.
+  pose proof (to_Z_bounded (snd st)) as Bs.
+  destruct (Z_lt_le_dec (Z.of_nat u) 4194304) as [Hu | Hu].
+  - pose proof (int_of_nat_small u Hu) as Eu.
+    destruct (int_of_nat u <? snd st)%uint63 eqn:C.
+    + apply ltb_spec in C. rewrite Eu in C.
+      assert (Ei : to_Z (snd st - 1 - int_of_nat u)%uint63 = (to_Z (snd st) - 1 - Z.of_nat u)%Z) by lia.
+      rewrite Hi by lia. rewrite Ei. f_equal. lia.
+    + rewrite nth_overflow; [reflexivity |].
+      destruct (Nat.lt_ge_cases u (List.length s)) as [H | H]; [| exact H].
+      exfalso. assert (Hlt : (int_of_nat u <? snd st)%uint63 = true) by (apply ltb_spec; lia). congruence.
+  - assert (Hlt : (int_of_nat u <? snd st)%uint63 = false).
+    { destruct (int_of_nat u <? snd st)%uint63 eqn:C; [| reflexivity]. apply ltb_spec in C.
+      rewrite int_of_nat_large in C by exact Hu. lia. }
+    rewrite Hlt. rewrite nth_overflow; [reflexivity |]. lia.
+Qed.
+
+Lemma holds_pushes ys st s : holds st s ->
+  (to_Z (snd st) + Z.of_nat (List.length ys) <= to_Z (PArray.length (fst st)))%Z ->
+  holds (fold_left fpush ys st) (rev ys ++ s) /\\ PArray.length (fst (fold_left fpush ys st)) = PArray.length (fst st).
+Proof.
+  revert st s. induction ys as [| y ys IH]; intros st s H Hl; [split; [exact H | reflexivity] |].
+  cbn [fold_left rev]. rewrite <- app_assoc. cbn [app].
+  destruct H as [Hb Hr]. cbn [List.length] in Hl.
+  destruct (holds_push st s y (conj Hb Hr)) as [H1 L1]; [lia |].
+  destruct (IH (fpush st y) (y :: s) H1) as [H2 L2].
+  - rewrite L1. destruct H1 as [Hb1 _]. rewrite Hb1. cbn [List.length]. lia.
+  - split; [exact H2 | rewrite L2; exact L1].
+Qed.
+
+Lemma holds_steps prog st s : holds st s ->
+  (to_Z (snd st) + Z.of_nat (List.length prog) <= to_Z (PArray.length (fst st)))%Z ->
+  holds (fold_left fstep (map fconv prog) st) (Prog.eval_generic ops prog s).
+Proof.
+  revert st s. induction prog as [| t prog IH]; intros st s H Hl; [exact H |].
+  cbn [map fold_left]. change (Prog.eval_generic ops (t :: prog) s)
+    with (Prog.eval_generic ops prog (Prog.eval_generic_body ops s t)).
+  set (v := match t with
+            | Prog.Forward u => nth u s (Prog.unknown ops)
+            | Prog.Unary o u => Prog.unary ops o (nth u s (Prog.unknown ops))
+            | Prog.Binary o u w => Prog.binary ops o (nth u s (Prog.unknown ops)) (nth w s (Prog.unknown ops))
+            end).
+  assert (E1 : fstep st (fconv t) = fpush st v).
+  { unfold fstep, v. destruct t; cbn [fconv]; rewrite ?(holds_get st s _ H); reflexivity. }
+  assert (E2 : Prog.eval_generic_body ops s t = v :: s) by (unfold v; destruct t; reflexivity).
+  rewrite E1, E2. destruct H as [Hb Hr]. cbn [List.length] in Hl.
+  destruct (holds_push st s v (conj Hb Hr)) as [H1 L1]; [lia |].
+  apply IH; [exact H1 |]. rewrite L1. destruct H1 as [Hb1 _]. rewrite Hb1. cbn [List.length]. lia.
+Qed.
+
+Theorem frun_correct prog xs k :
+  fres (frun prog (map fconv prog) xs) k = nth k (Prog.eval_generic ops prog xs) (Prog.unknown ops).
+Proof.
+  unfold frun. cbv zeta. rewrite length_map.
+  destruct (Z.leb_spec (Z.of_nat (List.length xs + List.length prog)) 4194303) as [Hn | Hn]; [| reflexivity].
+  cbn [fres]. remember (int_of_nat (List.length xs + List.length prog)) as N eqn:EN.
+  assert (HN : to_Z N = Z.of_nat (List.length xs + List.length prog)) by (rewrite EN; apply int_of_nat_small; lia).
+  assert (HL : to_Z (PArray.length (make N (Prog.unknown ops))) = to_Z N).
+  { rewrite length_make. destruct (PrimInt63.leb N max_length) eqn:C; [reflexivity |].
+    exfalso. assert (C' : PrimInt63.leb N max_length = true) by (apply leb_spec; rewrite HN; exact Hn). congruence. }
+  assert (H0 : holds (make N (Prog.unknown ops), 0%uint63) nil).
+  { unfold holds; cbn [fst snd]. split; [reflexivity |]. split; [lia |].
+    intros i Hi. pose proof (to_Z_bounded i). lia. }
+  destruct (holds_pushes (rev xs) _ nil H0) as [H1 L1].
+  { cbn [fst snd]. rewrite length_rev. lia. }
+  rewrite rev_involutive, app_nil_r in H1.
+  apply holds_get. apply holds_steps; [exact H1 |].
+  destruct H1 as [Hb1 _]. rewrite Hb1, L1. cbn [fst]. lia.
+Qed.
+
+End Fast.
+
+Arguments fres {A} ops res k.
+Arguments frun {A} ops prog fp xs.
+
+Definition dops := Private.IT2.IH.A.DiffValuator.diff_operations _ (Private.IT2.IH.A.BndValuator.operations 53%Z).
+Definition bops := Private.IT2.IH.A.BndValuator.operations 53%Z.
+
+Definition fbox_bounds (ap : list Prog.term) (fp : list fterm) (rest : list Private.I2.type) (na : nat)
+    (ti : Private.I2.type) : list Private.I2.type :=
+  let d := frun dops ap fp ((ti, Private.I2.mask (Private.I2.fromZ_small 1) ti)
+                            :: map (fun b => (b, Private.I2.mask Private.I2.zero ti)) rest) in
+  let mi := Private.IT2.IH.A.J.midpoint ti in
+  let vm := frun bops ap fp (mi :: rest) in
+  map (fun k => let yy := fres dops d k in
+                Private.I2.meet (fst yy) (Private.I2.add 53%Z (fres bops vm k)
+                  (Private.I2.mul 53%Z (Private.I2.sub 53%Z ti mi) (snd yy))))
+      (seq 0 na).
+
+Lemma fbox_bounds_eq ap rest na ti : fbox_bounds ap (map fconv ap) rest na ti = box_bounds ap rest na ti.
+Proof.
+  unfold fbox_bounds, box_bounds. cbv zeta. apply map_ext. intros k.
+  rewrite !frun_correct. reflexivity.
+Qed.
+
+Definition fdiff_eval (prog : list Prog.term) (fp : list fterm) (bounds : list Private.I2.type) (n : nat)
+    (xi : Private.I2.type) : Private.I2.type :=
+  let (yi, yi') := fres dops (frun dops prog fp ((xi, Private.I2.mask (Private.I2.fromZ_small 1) xi)
+                                                 :: map (fun b => (b, Private.I2.mask Private.I2.zero xi)) bounds)) n in
+  Private.IT2.IH.A.DiffValuator.diff_refining 53%Z xi yi yi' (fun b => fres bops (frun bops prog fp (b :: bounds)) n).
+
+Lemma fdiff_eval_eq prog bounds n xi :
+  fdiff_eval prog (map fconv prog) bounds n xi = Private.IT2.IH.A.DiffValuator.eval 53%Z prog bounds n xi.
+Proof.
+  unfold fdiff_eval, Private.IT2.IH.A.DiffValuator.eval. rewrite frun_correct.
+  replace (fun b => fres bops (frun bops prog (map fconv prog) (b :: bounds)) n)
+    with (fun b => nth n (Private.IT2.IH.A.BndValuator.eval 53%Z prog (b :: bounds)) Private.I2.nai)
+    by (apply functional_extensionality; intros b; rewrite frun_correct; reflexivity).
+  reflexivity.
+Qed.
+
+Definition frow_on (depth : nat) (row : list Prog.term * list Tree.expr) (fp : list fterm) (cb : list Private.I2.type)
+    (rest : list Private.I2.type) (thi : Private.I2.type) : bool :=
+  theta_ok depth (fun ti => Private.IT2.IH.R.eval_goal_bnd 53%Z wall_goal (fdiff_eval (fst row) fp (rest ++ cb) 0 ti)) thi.
+
+Lemma frow_on_eq depth row rest thi :
+  frow_on depth row (map fconv (fst row)) (map (Private.IT2.IH.T.eval_bnd 53%Z) (snd row)) rest thi = row_on depth row rest thi.
+Proof.
+  unfold frow_on, row_on. cbv zeta. f_equal. apply functional_extensionality. intros ti.
+  rewrite fdiff_eval_eq. reflexivity.
+Qed.
+
+Definition tag (row : list Prog.term * list Tree.expr) :=
+  (row, (map fconv (fst row), map (Private.IT2.IH.T.eval_bnd 53%Z) (snd row))).
+
+Fixpoint fradial_cells (outer depth : nat) (ap : list Prog.term) (fp : list fterm) (cb : list Private.I2.type) (na : nat)
+    (rows : list ((list Prog.term * list Tree.expr) * (list fterm * list Private.I2.type))) (ri thi : Private.I2.type)
+    {struct outer} : bool :=
+  let rest := ri :: fbox_bounds ap fp cb na ri in
+  match filter (fun row => negb (frow_on depth (fst row) (fst (snd row)) (snd (snd row)) rest thi)) rows with
+  | nil => true
+  | bad => match outer with
+           | O => false
+           | S o => fradial_cells o depth ap fp cb na bad (fst (Private.I2.bisect ri)) thi
+                    && fradial_cells o depth ap fp cb na bad (snd (Private.I2.bisect ri)) thi
+           end
+  end.
+
+Lemma fradial_cells_eq outer depth ap ac na rows ri thi :
+  fradial_cells outer depth ap (map fconv ap) (map (Private.IT2.IH.T.eval_bnd 53%Z) ac) na (map tag rows) ri thi
+  = radial_cells outer depth ap ac na rows ri thi.
+Proof.
+  revert rows ri. induction outer as [| o IH]; intros rows ri; cbn [fradial_cells radial_cells]; cbv zeta;
+    rewrite fbox_bounds_eq; fold (radial_bounds ap ac na ri);
+    (assert (F : filter (fun row => negb (frow_on depth (fst row) (fst (snd row)) (snd (snd row))
+                                            (ri :: radial_bounds ap ac na ri) thi)) (map tag rows)
+                 = map tag (filter (fun row => negb (row_on depth row (ri :: radial_bounds ap ac na ri) thi)) rows)) by
+       (induction rows as [| row rows IHr]; [reflexivity |]; cbn [map filter]; unfold tag at 1; cbn [fst snd];
+        rewrite frow_on_eq; destruct (negb (row_on depth row _ thi)); [cbn [map]; f_equal |]; exact IHr));
+    rewrite F; destruct (filter _ rows) as [| p l]; try reflexivity.
+  cbn [map]. change (tag p :: map tag l) with (map tag (p :: l)). rewrite !IH. reflexivity.
+Qed.
+
+(* the check of radial_check, run on arrays *)
+Definition fradial_check (outer depth : nat) (ap : list Prog.term) (ac ae re : list Tree.expr) : bool :=
+  forallb (fun c => Prog.max_arity c 0) ac
+  && forallb (fun k => Prog.expr_beq (nth k (Prog.eval_generic tree_ops ap (map Tree.Evar (seq 0 1) ++ ac))
+                                        (Tree.Econst (Tree.Int 0))) (nth k ae (Tree.Econst (Tree.Int 0))))
+       (seq 0 (List.length ae))
+  && forallb (fun e => match Prog.extract e (2 + List.length ae) with Prog.Eabort => false | Prog.Eprog _ _ => true end) re
+  && fradial_cells outer depth ap (map fconv ap) (map (Private.IT2.IH.T.eval_bnd 53%Z) ac) (List.length ae)
+       (map tag (map (radial_row (List.length ae)) re))
+       (nth 0 (Private.IT2.IH.R.merge_hyps 53%Z wall_hyps) Private.I2.nai)
+       (nth 1 (Private.IT2.IH.R.merge_hyps 53%Z wall_hyps) Private.I2.nai).
+
+Lemma fradial_check_eq outer depth ap ac ae re : fradial_check outer depth ap ac ae re = radial_check outer depth ap ac ae re.
+Proof. unfold fradial_check, radial_check. rewrite fradial_cells_eq. reflexivity. Qed.
+
+End Fast.
 
 (* the side conditions of auto_derive and field in the derivative lemmas: each a denominator shown nonzero on the
    wall by Interval *)
 Ltac nonzero r := repeat split;
   first [ exact I | lra | apply Rgt_not_eq; interval with (i_bisect r) | apply Rlt_not_eq; interval with (i_bisect r) ].
+
+(* the same at a face, and in the cavity or the exterior of a drag shell *)
+Ltac nonzero_at := repeat split;
+  first [ exact I | lra | apply Rgt_not_eq; lra | apply pow_nonzero; apply Rgt_not_eq; lra
+        | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
+
+(* a drag shell's cavity for r < 1, its wall for 1 <= r <= 2 and its exterior beyond *)
+Definition region (inside wall outside r : R) : R :=
+  if Rlt_dec r 1 then inside else if Rle_dec r 2 then wall else outside.
+
+Lemma region_inside i w o r : r < 1 -> region i w o r = i.
+Proof. intros H. unfold region. destruct (Rlt_dec r 1); [reflexivity | contradiction]. Qed.
+
+Lemma region_wall i w o r : 1 <= r <= 2 -> region i w o r = w.
+Proof. intros H. unfold region. destruct (Rlt_dec r 1); [lra |]. destruct (Rle_dec r 2); [reflexivity | lra]. Qed.
+
+Lemma region_outside i w o r : 2 < r -> region i w o r = o.
+Proof. intros H. unfold region. destruct (Rlt_dec r 1); [lra |]. destruct (Rle_dec r 2); [lra | reflexivity]. Qed.
 """
 
 
-def drag_closed_jets(M, b, f=(0, 0), h=(0, 0)):
-    """Jets of a closed-form drag shell on 1 <= r <= 2, x = r - 1: psi = 1 + 5M/16 - M x^2/16, N = (2 - psi)/psi,
-    f = b (S + B (f0 + f1 x)) and h = b (S + B (h0 + h1 x)) with S = 1 - 3x^2 + 2x^3 and B = x^2 (1 - x)^2. B and its
-    slope vanish at both faces, so f and h meet a flat cavity drifting at b inside and the exterior at rest as the
-    closed-form shell's f = h = b S does."""
+def drag_closed_jets(M, b, f=(0, 0), h=(0, 0), p=()):
+    """Jets of a closed-form drag shell on 1 <= r <= 2, x = r - 1: psi = 1 + 5M/16 - M x^2/16 + B (p0 + p1 x + ...),
+    N = (2 - psi)/psi, f = b (S + B (f0 + f1 x + ...)) and h = b (S + B (h0 + h1 x + ...)) with S = 1 - 3x^2 + 2x^3
+    and B = x^2 (1 - x)^2. B and its slope vanish at both faces, so psi, N, f and h meet a flat cavity drifting at b
+    inside and Schwarzschild's exterior at rest outside as the closed-form shell's do."""
     x = SR - 1
     S, B = 1 - 3 * x ** 2 + 2 * x ** 3, x ** 2 * (1 - x) ** 2
-    psi = 1 + sp.Rational(5, 16) * M - sp.Rational(1, 16) * M * x ** 2
-    profiles = (("N", (2 - psi) / psi), ("psi", psi), ("f", b * (S + B * (f[0] + f[1] * x))),
-                ("h", b * (S + B * (h[0] + h[1] * x))))
+
+    def poly(co):
+        return sum((c * x ** i for i, c in enumerate(co)), sp.Integer(0))
+
+    psi = 1 + sp.Rational(5, 16) * M - sp.Rational(1, 16) * M * x ** 2 + B * poly(p)
+    profiles = (("N", (2 - psi) / psi), ("psi", psi), ("f", b * (S + B * poly(f))), ("h", b * (S + B * poly(h))))
     out = {}
     for nm, e in profiles:
         for k, suf in enumerate(("", "_r", "_rr")):
@@ -6915,50 +7442,71 @@ def drag_closed_jets(M, b, f=(0, 0), h=(0, 0)):
 
 
 class CertifiableDragProblem:
-    """The search for a closed-form drag shell that its certificate proves: `drag_closed_jets` with the parameters
-    b, f0, f1, h0 and h1, and the multipliers mu = k1 rho and lam = k2 rho^2 of `certified`, rho the static density.
-    The goal is the drift of the cavity's free-fall frame, b psi0^2 / N0 at the inner face. The rows are those of
-    `certified`, each sum of absolute values written as its four sums of signs, relative to rho, or to rho^2 for those
-    of lam eta - T eta T, at nr radii and nc cosines over the wall."""
+    """The search for a closed-form drag shell that its certificate proves: `drag_closed_jets` with the amplitude b,
+    shift shapes f and h of degree `shape` and a bump p in psi of degree `bump`, and the multipliers mu = E k1 and
+    lam = E^2 k2 of `certified`, E the shell's energy density and k1, k2 each a polynomial k0 + k1 x + k2 x^2 + k3 c^2
+    over the wall. The goal is the drift of the cavity's free-fall frame, b psi0^2 / N0 at the inner face. The rows are
+    those of `certified`, each sum of absolute values written as its four sums of signs, relative to rho, the density
+    of the shell at rest with no bump, or to rho^2 for those of lam eta - T eta T, at nr radii and nc cosines over the
+    wall."""
 
-    NAMES = ("b", "f0", "f1", "h0", "h1", "k1", "k2")
+    TERMS = 4  # the terms 1, x, x^2 and c^2 of each multiplier
 
-    def __init__(self, M, nr=41, nc=17):
+    def __init__(self, M, shape=3, bump=1, nr=41, nc=17):
         self.jnp = jnp = _jax()[1]
-        self.M = sp.Rational(M)
+        self.M, self.shape, self.bump = sp.Rational(M), shape, bump
         rg, cg = np.meshgrid(wall_radii(1.0, 2.0, nr), np.linspace(-1.0, 1.0, nc), indexing="ij")
         self.r, self.c = jnp.asarray(rg), jnp.asarray(cg)
-        p = sp.symbols(" ".join(self.NAMES[:5]), real=True)
-        jets = drag_closed_jets(self.M, p[0], p[1:3], p[3:5])
+        self.groups = {"b": 1, "f": shape + 1, "h": shape + 1, "p": bump + 1, "k1": self.TERMS, "k2": self.TERMS}
+        self.nj = 1 + 2 * (shape + 1) + bump + 1
+        q = sp.symbols("q0:%d" % self.nj, real=True)
+        f, h, p = self.split(q)[1:4]
+        jets = drag_closed_jets(self.M, q[0], f, h, p)
         self.names = list(jets)
-        self.jets = sp.lambdify([SR, *p], [jets[k] for k in self.names], "jax")
-        self.rho = self.tensors(jnp.zeros(5))[..., 0, 0]
+        self.jets = sp.lambdify([SR, *q], [jets[k] for k in self.names], "jax")
+        self.rho = self.tensors(jnp.zeros(self.nj))[..., 0, 0]
+        x = self.r - 1.0
+        self.basis = [jnp.ones_like(x), x, x * x, self.c ** 2]
+
+    def split(self, th):
+        """The parameters by group: b, f, h, p, k1 and k2."""
+        out, at = [], 0
+        for n in self.groups.values():
+            out.append(th[at:at + n])
+            at += n
+        return out
 
     def initial(self):
-        """The closed-form drag shell of the certificates."""
-        return np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5])
+        """The closed-form drag shell of the certificates, with constant multipliers."""
+        k = [0.5] + [0.0] * (self.TERMS - 1)
+        return np.concatenate([[0.01], np.zeros(self.nj - 1), k, k])
 
     def scales(self, th):
         """Trust-region scale of each parameter."""
-        return np.array([max(abs(th[0]), 1e-3), 1.0, 1.0, 1.0, 1.0, 0.2, 0.2])
+        return np.concatenate([[max(abs(th[0]), 1e-3)], np.ones(2 * (self.shape + 1)),
+                               np.full(self.bump + 1, 0.02 * float(self.M)), np.full(2 * self.TERMS, 0.2)])
 
     def tensors(self, th):
         """8 pi T at the sample points."""
         jnp = self.jnp
-        vals = {k: jnp.broadcast_to(v, self.r.shape) for k, v in zip(self.names, self.jets(self.r, *th[:5]))}
+        vals = {k: jnp.broadcast_to(v, self.r.shape) for k, v in zip(self.names, self.jets(self.r, *th[:self.nj]))}
         vals.update(r=self.r, c=self.c, s=jnp.sqrt(jnp.maximum(1 - self.c ** 2, 0.0)), b=1.0, b_t=0.0)
         return 8 * jnp.pi * family_tensor("drag", vals, "jax")
+
+    def multipliers(self, th, E):
+        """mu and lam at the sample points, for the energy density E there."""
+        k1, k2 = self.split(th)[4:]
+        return (E * sum(co * b for co, b in zip(k1, self.basis)), E ** 2 * sum(co * b for co, b in zip(k2, self.basis)))
 
     def rows(self, th):
         """The rows at every sample point, as an array (points, rows)."""
         jnp = self.jnp
         T, rho = self.tensors(th), self.rho
         E, a, d, S, x, Th, P = (T[..., i, j] for i, j in DRAG_KEYS)
-        mu, lam = th[5] * rho, th[6] * rho ** 2
+        mu, lam = self.multipliers(th, E)
         D00, D01, D02 = -lam + E * E - a * a - d * d, E * a - a * S - d * x, E * d - a * x - d * Th
         D11, D12, D22 = lam + a * a - S * S - x * x, a * d - x * (S + Th), lam + d * d - x * x - Th * Th
-        out = [(P + mu) / rho, (mu + (-E + S + Th + P) / 2) / rho, (lam - P * P) / rho ** 2, th[5] + 0 * rho,
-               th[6] + 0 * rho]
+        out = [(P + mu) / rho, (mu + (-E + S + Th + P) / 2) / rho, (lam - P * P) / rho ** 2, mu / rho, lam / rho ** 2]
         for s1, s2 in itertools.product((1.0, -1.0), repeat=2):
             out += [(E - mu - s1 * a - s2 * d) / rho, (S + mu - s1 * a - s2 * x) / rho,
                     (Th + mu - s1 * d - s2 * x) / rho, (D00 - s1 * D01 - s2 * D02) / rho ** 2,
@@ -6971,28 +7519,311 @@ class CertifiableDragProblem:
         return th[0] * psi0 ** 3 / (2 - psi0)
 
 
-def certifiable_drag(M, eps=0.15, verbose=False):
+class ExactConditions:
+    """A certifiable problem's family held to the exact conditions at its sample points, where its certificate's
+    search can start."""
+
+    def __init__(self, prob):
+        self.prob = prob
+
+    def initial(self):
+        """The problem's start, without its multipliers."""
+        return self.prob.initial()[: self.prob.nj]
+
+    def scales(self, th):
+        """The problem's trust-region scales of the parameters of the shell."""
+        return self.prob.scales(np.concatenate([th, self.prob.initial()[self.prob.nj:]]))[: self.prob.nj]
+
+    def tensor(self, th):
+        """T at every sample point, as an array (points, 4, 4)."""
+        return self.prob.tensors(th).reshape(-1, 4, 4)
+
+    def goal(self, th):
+        """The drift."""
+        return self.prob.goal(th)
+
+
+# the denominators, powers of 2, that certifiable rounds each group of parameters to
+ROUNDING = {"b": 2**16, "f": 2**8, "h": 2**8, "p": 2**12, "k1": 2**8, "k2": 2**8}
+
+
+def certifiable_drag(M, eps=0.15, shape=3, bump=1, verbose=False):
     """The closed-form drag shell of mass M of greatest drift that its certificate's rows admit with relative margin
-    eps, found by `slp` from the certificates' closed-form drag shell. Its parameters are rounded to fractions over
-    powers of 2, which keep the integers of its jets short, and its amplitude lowered when that is needed
-    for its rows to hold above eps / 4 on a grid four times finer. Returns the parameters as fractions, the mass, the
-    drift and that least row, or None."""
-    prob = CertifiableDragProblem(M)
-    th, _ = slp(prob, eps=eps, verbose=verbose)
-    finer = CertifiableDragProblem(M, 161, 65)
-    for shrink in (1.0, 0.99, 0.97, 0.94, 0.9):
-        exact = [sp.Rational(round(v * 2**8), 2**8) for v in th]
-        exact[0] = sp.Rational(round(th[0] * shrink * 2**16), 2**16)
-        values = np.array([float(v) for v in exact])
-        least = float(np.asarray(finer.rows(values)).min())
-        if least > eps / 4:
-            return {"M": str(sp.Rational(M)), **{k: str(v) for k, v in zip(prob.NAMES, exact)},
-                    "drift": float(prob.goal(values)), "least_row": least}
-    return None
+    eps, found by `slp` from the certificates' closed-form drag shell and from the family's best under the exact
+    conditions. Its parameters are rounded to fractions over powers of 2, which keep the integers of its jets short,
+    and its amplitude lowered when that is needed for its rows to hold above eps / 4 on a grid four times finer.
+    Returns the parameters as fractions, the mass, the drift and that least row, or None."""
+    prob = CertifiableDragProblem(M, shape, bump)
+    start, _ = slp(ExactConditions(prob), eps=eps, iters=300, verbose=verbose)
+    found = [slp(prob, eps=eps, iters=300, verbose=verbose)[0],
+             slp(prob, eps=eps, iters=300, verbose=verbose, th0=np.concatenate([start, prob.initial()[prob.nj:]]),
+                 trust=0.1)[0]]
+    finer = CertifiableDragProblem(M, shape, bump, 161, 65)
+    best = None
+    for th in found:
+        for shrink in (1.0, 0.99, 0.97, 0.94, 0.9):
+            groups = [[sp.Rational(round(float(v) * (shrink if name == "b" else 1) * ROUNDING[name]), ROUNDING[name])
+                       for v in part] for name, part in zip(prob.groups, prob.split(th))]
+            values = np.array([float(v) for part in groups for v in part])
+            least = float(np.asarray(finer.rows(values)).min())
+            if least > eps / 4:
+                drift = float(prob.goal(values))
+                if best is None or drift > best["drift"]:
+                    best = {"M": str(sp.Rational(M)), "b": str(groups[0][0]),
+                            **{name: [str(v) for v in part] for name, part in zip(list(prob.groups)[1:], groups[1:])},
+                            "drift": drift, "least_row": least}
+                break
+    return best
 
 
-def rocket_closed_jets(delta, a, kappa, adot=0):
-    """Jets of the closed-form rocket shell on 1 <= r <= 2: E = 1 - delta (2 - r), cluster mass, U = a (3x^2 - 2x^3), E^2 W = a (5x^2 - 3x^3), e = 0, x = r - 1."""
+class CertifiableRocketProblem:
+    """The search for a rocket shell of `rocket_bern_jets` that its certificate proves, at mass M: the acceleration a,
+    the interior Bernstein coefficients of g, u and v of degree n, the lapse's dipole e held at zero, and the
+    multipliers mu = E k1 and lam = E^2 k2 of `certified`, each k a polynomial k0 + k1 x + k2 x^2 + k3 c^2 + k4 c over
+    the wall. The depth lam follows from M. The goal is the acceleration. The rows are those of `certified` on the frame
+    at rest in the shell's coordinates, as certificate_module writes it, relative to the density 2 m_r / r^2 of the
+    start, at nr radii and nc cosines."""
+
+    TERMS = 5  # the terms 1, x, x^2, c^2 and c of each multiplier
+
+    def __init__(self, M, n=14, kappa=1.25, nr=41, nc=33):
+        self.jnp = jnp = _jax()[1]
+        self.M, self.n, self.kappa = float(M), n, kappa
+        self.groups = {"a": 1, "g": n - 1, "u": n - 3, "v": n - 3, "q": 0, "k1": self.TERMS, "k2": self.TERMS}
+        self.nj = 1 + (n - 1) + 2 * (n - 3)
+        rg, cg = np.meshgrid(wall_radii(1.0, 2.0, nr), np.linspace(-1.0, 1.0, nc), indexing="ij")
+        self.r1, self.c = jnp.asarray(rg[:, 0]), jnp.asarray(cg)
+        x = jnp.asarray(rg) - 1.0
+        self.basis = [jnp.ones_like(x), x, x * x, self.c ** 2, self.c]
+        self.gx, self.gw = jnp.asarray(GL_X), jnp.asarray(GL_W)
+        self.rho = None
+
+    def split(self, th):
+        """The parameters by group: a, g, u, v, q, k1 and k2."""
+        out, at = [], 0
+        for k in self.groups.values():
+            out.append(th[at:at + k])
+            at += k
+        return out
+
+    def coefficients(self, th):
+        """The acceleration and the full coefficients of g, U, E^2 W and e, which is zero, their end coefficients
+        fixed."""
+        jnp, n = self.jnp, self.n
+        a, g, u, v, q = self.split(th)[:5]
+        cg = jnp.concatenate([jnp.ones(1), g, jnp.zeros(1)])
+        cu = a * jnp.concatenate([jnp.zeros(2), u, jnp.ones(2)])
+        cv = a * jnp.concatenate([jnp.zeros(2), v, jnp.asarray([2.0 - 1.0 / n, 2.0])])
+        cq = a * jnp.concatenate([jnp.zeros(2), q, jnp.zeros(2)])
+        return a[0], cg, cu, cv, cq
+
+    def depth(self, cg):
+        """lam with M = lam A1 + lam^2 A2, A1 = 1 + int g and A2 = -(1 + int g^2) / 2."""
+        jnp = self.jnp
+        gt = bern_eval(cg, (self.gx + 1) / 2, 0, jnp)
+        A1 = 1 + (gt * self.gw).sum() / 2
+        A2 = -(1 + (gt * gt * self.gw).sum() / 2) / 2
+        return (-A1 + jnp.sqrt(A1 * A1 + 4 * A2 * self.M)) / (2 * A2)
+
+    def jets(self, th):
+        """The jets at the sample radii, the integrals by Gauss-Legendre quadrature, exact for these polynomials."""
+        jnp = self.jnp
+        a, cg, cu, cv, cq = self.coefficients(th)
+        lam = self.depth(cg)
+        r = self.r1
+        x = r - 1.0
+        g, g1, g2 = (bern_eval(cg, x, k, jnp) for k in range(3))
+        E, E_r, E_rr = 1 - lam * g, -lam * g1, -lam * g2
+        tn = x[:, None] * (self.gx + 1) / 2
+        gn, gn1 = bern_eval(cg, tn, 0, jnp), bern_eval(cg, tn, 1, jnp)
+        N = x / 2 * (((1 + tn) * (1 - lam * gn) * (-lam * gn1)) * self.gw).sum(-1)
+        Nl = x / 2 * (((1 + tn) * (-gn1 + 2 * lam * gn * gn1)) * self.gw).sum(-1)
+        m = N / E ** 2
+        m_r = E_r * (r - 2 * m) / E
+        m_rr = (E_rr * (r - 2 * m) + E_r * (1 - 2 * m_r)) / E - E_r * E_r * (r - 2 * m) / E ** 2
+        m_l = Nl / E ** 2 + 2 * N * g / E ** 3
+        m_lr = (r * (-g1 + 2 * lam * g * g1) / E ** 2 - 2 * Nl * E_r / E ** 3
+                + 2 * (r * E * E_r * g + N * g1) / E ** 3 - 6 * N * g * E_r / E ** 4)
+        t1 = (self.gx + 1) / 2
+        g_1, g1_1 = bern_eval(cg, t1, 0, jnp), bern_eval(cg, t1, 1, jnp)
+        Ml = (((1 + t1) * (-g1_1 + 2 * lam * g_1 * g1_1)) * self.gw).sum() / 2
+        rate = -3 * self.kappa * a * self.M / Ml
+        V, V_r, V_rr = (bern_eval(cv, x, k, jnp) for k in range(3))
+        W = V / E ** 2
+        W_r = V_r / E ** 2 - 2 * V * E_r / E ** 3
+        W_rr = V_rr / E ** 2 - 4 * V_r * E_r / E ** 3 - 2 * V * E_rr / E ** 3 + 6 * V * E_r ** 2 / E ** 4
+        W_l = 2 * V * g / E ** 3
+        W_lr = 2 * (V_r * g + V * g1) / E ** 3 - 6 * V * g * E_r / E ** 4
+        U, U_r, U_rr = (bern_eval(cu, x, k, jnp) for k in range(3))
+        e, e_r, e_rr = (bern_eval(cq, x, k, jnp) for k in range(3))
+        z = 0 * x
+        return {"r": r, "E": E, "E_r": E_r, "E_u": -g * rate, "E_rr": E_rr, "E_ru": -g1 * rate,
+                "e": e, "e_r": e_r, "e_u": z, "e_rr": e_rr, "e_ru": z,
+                "m": m, "m_r": m_r, "m_u": m_l * rate, "m_rr": m_rr, "m_ru": m_lr * rate,
+                "W": W, "W_r": W_r, "W_u": W_l * rate, "W_rr": W_rr, "W_ru": W_lr * rate,
+                "U": U, "U_r": U_r, "U_u": z, "U_rr": U_rr, "U_ru": z}
+
+    def tensors(self, th):
+        """T on the null frame's (k + l)/sqrt2 frame, for the exact conditions, which no frame changes."""
+        jnp = self.jnp
+        vals = {k: v[:, None] for k, v in self.jets(th).items()}
+        vals.update(c=self.c, s=jnp.sqrt(jnp.maximum(1 - self.c ** 2, 0.0)))
+        return family_tensor("rocket", vals, "jax")
+
+    def frame(self, th):
+        """8 pi T on the frame (q k + l/q)/sqrt2, (q k - l/q)/sqrt2, e_th, e_ph with q^2 = H0/2, H0 = 1 - 2m/r."""
+        jnp = self.jnp
+        j = self.jets(th)
+        vals = {k: v[:, None] for k, v in j.items()}
+        vals.update(c=self.c, s=jnp.sqrt(jnp.maximum(1 - self.c ** 2, 0.0)))
+        kk, kl, ll, k2, l2, t22, t33 = (8 * jnp.pi * w for w in forms("rocket", "jax")(*[vals[k] for k in family_args("rocket")]))
+        H = (1 - 2 * j["m"] / j["r"])[:, None]
+        q = jnp.sqrt(H / 2)
+        comp = ((H * kk / 2 + 2 * kl + 2 * ll / H) / 2, (H * kk / 2 - 2 * ll / H) / 2, (H * k2 / 2 + l2) / q,
+                (H * kk / 2 - 2 * kl + 2 * ll / H) / 2, (H * k2 / 2 - l2) / q, t22, t33)
+        return [jnp.broadcast_to(w, self.c.shape) for w in comp]
+
+    def set_scale(self, th):
+        """Hold the rows relative to the density 2 m_r / r^2 of the shell th."""
+        j = self.jets(self.jnp.asarray(th))
+        self.rho = (2 * self.jnp.abs(j["m_r"]) / j["r"] ** 2)[:, None] + 0 * self.c
+
+    def rows(self, th):
+        """The rows at every sample point, as an array (points, rows)."""
+        jnp, rho = self.jnp, self.rho
+        E, a, d, S, x, Th, P = self.frame(th)
+        k1, k2 = self.split(th)[5:]
+        mu = E * sum(co * b for co, b in zip(k1, self.basis))
+        lam = E ** 2 * sum(co * b for co, b in zip(k2, self.basis))
+        D00, D01, D02 = -lam + E * E - a * a - d * d, E * a - a * S - d * x, E * d - a * x - d * Th
+        D11, D12, D22 = lam + a * a - S * S - x * x, a * d - x * (S + Th), lam + d * d - x * x - Th * Th
+        out = [(P + mu) / rho, (mu + (-E + S + Th + P) / 2) / rho, (lam - P * P) / rho ** 2, mu / rho, lam / rho ** 2]
+        for s1, s2 in itertools.product((1.0, -1.0), repeat=2):
+            out += [(E - mu - s1 * a - s2 * d) / rho, (S + mu - s1 * a - s2 * x) / rho,
+                    (Th + mu - s1 * d - s2 * x) / rho, (D00 - s1 * D01 - s2 * D02) / rho ** 2,
+                    (D11 - s1 * D01 - s2 * D12) / rho ** 2, (D22 - s1 * D02 - s2 * D12) / rho ** 2]
+        return jnp.stack([row.ravel() for row in out], axis=1)
+
+    def goal(self, th):
+        """The acceleration."""
+        return th[0]
+
+    def scales(self, th):
+        """Trust-region scale of each parameter."""
+        return np.concatenate([[max(abs(float(th[0])), 1e-5)], np.full(self.n - 1, 0.1), np.ones(2 * (self.n - 3)),
+                               np.full(2 * self.TERMS, 0.2)])
+
+    def initial(self):
+        """The closed-form rocket shell's profiles in this basis, at a small acceleration, with constant multipliers."""
+        n = self.n
+        k = np.arange(n + 1) / n
+        g = 1 - k
+        th = [[1e-4 * self.M], g[1:-1], np.zeros(n - 3), np.zeros(n - 3)]
+        x = np.linspace(0.0, 1.0, 201)
+        B = np.stack([math.comb(n, j) * x ** j * (1 - x) ** (n - j) for j in range(n + 1)], 1)
+        for i, (prof, ends) in enumerate(((3 * x ** 2 - 2 * x ** 3, [0, 0, 1, 1]),
+                                          (5 * x ** 2 - 3 * x ** 3, [0, 0, 2 - 1 / n, 2]))):
+            fixed = np.zeros(n + 1)
+            fixed[:2], fixed[-2:] = ends[:2], ends[2:]
+            th[2 + i] = np.linalg.lstsq(B[:, 2:n - 1], prof - B @ fixed, rcond=None)[0]
+        kk = [0.5] + [0.0] * (self.TERMS - 1)
+        return np.concatenate(th + [kk, kk])
+
+    def from_design(self, design):
+        """The parameters nearest a stored RocketDesign of the same mass: its E fitted by g, its U and E^2 W over a
+        fitted in degree n, with constant multipliers."""
+        n, a = self.n, design["a"]
+        r = np.linspace(1.0, 2.0, 201)
+        x = r - 1
+        E = np.exp(cluster_integrals(1.0, 2.0, np.asarray(design["m"]), r)[0])
+        B = np.stack([math.comb(n, j) * x ** j * (1 - x) ** (n - j) for j in range(n + 1)], 1)
+        g = np.linalg.lstsq(B[:, 1:n], (1 - E) / (1 - E[0]) - B[:, 0], rcond=None)[0]
+
+        def refit(coef, ends):
+            fixed = np.zeros(n + 1)
+            fixed[:2], fixed[-2:] = ends[:2], ends[2:]
+            return np.linalg.lstsq(B[:, 2:n - 1], bern_eval(np.asarray(coef) / a, x) - B @ fixed, rcond=None)[0]
+
+        kk = [0.5] + [0.0] * (self.TERMS - 1)
+        return np.concatenate([[a], g, refit(design["U"], [0, 0, 1, 1]), refit(design["V"], [0, 0, 2 - 1 / n, 2]), kk, kk])
+
+
+class _RocketExact:
+    """A certifiable rocket problem's family held to the exact conditions, from a given start."""
+
+    def __init__(self, prob, th0):
+        self.prob, self.th0 = prob, np.asarray(th0)
+
+    def initial(self):
+        return self.th0[: self.prob.nj]
+
+    def scales(self, th):
+        return self.prob.scales(np.concatenate([th, self.th0[self.prob.nj:]]))[: self.prob.nj]
+
+    def tensor(self, th):
+        return self.prob.tensors(th).reshape(-1, 4, 4)
+
+    def goal(self, th):
+        return th[0]
+
+
+# the denominators, powers of 2, that certifiable rounds each group of a rocket shell's parameters to
+ROCKET_ROUNDING = {"a": 2**20, "g": 2**12, "u": 2**8, "v": 2**8, "q": 2**8, "k1": 2**8, "k2": 2**8}
+
+
+def certifiable_rocket(M, eps=0.15, n=14, kappa=sp.Rational(5, 4), verbose=False, grid=(41, 33)):
+    """The rocket shell of `rocket_bern_jets` near mass M of greatest acceleration that its certificate's rows admit
+    with relative margin eps, found by `slp` from the rocket table's design of that mass, held first to the exact
+    conditions and then to the certificate from fractions of its acceleration, or from the closed-form shell where the
+    table has none. Its parameters are rounded to fractions over powers of 2 and its depth fixed by M, so that its mass
+    is a fraction near M, and its acceleration lowered when that is needed for its rows to hold above eps / 4 on a grid
+    of 161 radii and 129 cosines; the search's own grid has `grid` radii and cosines. Returns the parameters as
+    fractions, the mass, the acceleration over the mass and that least row, or None."""
+    prob = CertifiableRocketProblem(M, n, float(kappa), *grid)
+    jnp = prob.jnp
+    table = load_store()["tables"].get("rocket_inner0.50_necwecdecsec", {}).get("rows", [])
+    near = [row for row in table if abs(row["M"] - float(M)) < 1e-9]
+    th0 = prob.from_design(near[0]["design"]) if near else prob.initial()
+    prob.set_scale(th0)
+    start, _ = slp(_RocketExact(prob, th0), eps=0.02, iters=300, trust=0.1, verbose=verbose)
+    found = []
+    for share in (0.3, 0.5):
+        th1 = np.concatenate([start, th0[prob.nj:]])
+        th1[0] *= share
+        th, info = slp(prob, eps=eps, iters=400, th0=th1, trust=0.1, verbose=verbose)
+        if info["worst"] > eps / 2:
+            found.append(th)
+    finer = CertifiableRocketProblem(M, n, float(kappa), 161, 129)
+    finer.rho = None
+    best = None
+    for th in found:
+        for shrink in (1.0, 0.99, 0.97, 0.94, 0.9, 0.85):
+            groups = [[sp.Rational(round(float(v) * (shrink if name == "a" else 1) * ROCKET_ROUNDING[name]),
+                                   ROCKET_ROUNDING[name]) for v in part] for name, part in zip(prob.groups, prob.split(th))]
+            values = np.array([float(v) for part in groups for v in part])
+            cg = [sp.Integer(1)] + groups[1] + [sp.Integer(0)]
+            lam = sp.Rational(round(float(prob.depth(jnp.asarray([float(c) for c in cg]))) * 2**20), 2**20)
+            finer.set_scale(values)
+            least = float(np.asarray(finer.rows(values)).min())
+            if least > eps / 4:
+                a = groups[0][0]
+                u = [0, 0] + groups[2] + [1, 1]
+                v = [0, 0] + groups[3] + [2 - sp.Rational(1, n), 2]
+                q = [0, 0] + groups[4] + [0, 0]
+                _, Mx, _ = rocket_bern_jets(lam, a, cg, u, v, q, kappa)
+                if best is None or float(a / Mx) > best["accel_over_mass"]:
+                    best = {"M": str(Mx), "target": str(M), "lam": str(lam), "a": str(a), "kappa": str(kappa),
+                            "g": [str(c) for c in cg], "u": [str(c) for c in u], "v": [str(c) for c in v],
+                            "q": [str(c) for c in q], "k1": [str(c) for c in groups[5]], "k2": [str(c) for c in groups[6]],
+                            "accel_over_mass": float(a / Mx), "least_row": least}
+                break
+    return best
+
+
+def rocket_closed_jets(delta, a, kappa, adot=0, evolution=False):
+    """Jets of the closed-form rocket shell on 1 <= r <= 2: E = 1 - delta (2 - r), cluster mass, U = a (3x^2 - 2x^3),
+    E^2 W = a (5x^2 - 3x^3), e = 0, x = r - 1, and its mass M at r = 2. With `evolution`, also the profiles E, m and W
+    as functions of the depth dl, which the exhaust moves at d dl / du = -3 kappa a M / (dM / d dl), and that rate."""
     dl, av = sp.symbols("dl av", real=True)
     x = SR - 1
     E = 1 - dl * (1 - x)
@@ -7006,7 +7837,129 @@ def rocket_closed_jets(delta, a, kappa, adot=0):
         du = sp.diff(e, dl) * rate + sp.diff(e, av) * adot
         for suf, v in (("", e), ("_r", sp.diff(e, SR)), ("_u", du), ("_rr", sp.diff(e, SR, 2)), ("_ru", sp.diff(du, SR))):
             out[nm + suf] = sp.cancel(sp.sympify(v).subs({dl: delta, av: a}))
-    return out, sp.cancel(M.subs(dl, delta))
+    if not evolution:
+        return out, sp.cancel(M.subs(dl, delta))
+    evo = {"param": dl, "at": delta, "rate": sp.cancel(rate.subs(av, a)),
+           **{nm: sp.cancel(fun[nm].subs(av, a)) for nm in ("E", "m", "W")}}
+    return out, sp.cancel(M.subs(dl, delta)), evo
+
+
+def bernstein(co, x):
+    """The polynomial with Bernstein coefficients co on 0 <= x <= 1."""
+    n = len(co) - 1
+    return sum((c * math.comb(n, k) * x ** k * (1 - x) ** (n - k) for k, c in enumerate(co)), sp.Integer(0))
+
+
+def rocket_bern_jets(lam, a, g, u, v, q, kappa, texts=False):
+    """Jets of a rocket shell on 1 <= r <= 2 with Bernstein profiles in x = r - 1: E = 1 - lam g(x) with g(0) = 1 and
+    g(1) = 0, the cluster mass m = int_0^x (1 + t) E E_t dt / E^2, U = a u(x), E^2 W = a v(x) and e = a q(x), the end
+    coefficients of u, v and q those that meet the cavity and Kinnersley's exterior to first order. The exhaust moves
+    the depth lam at fixed shapes, at d lam / du = -3 kappa a M / (dM / d lam) with M = m(2). Returns the jets, the
+    mass and the evolution: E, m and W as functions of the depth dl, and that rate. Every jet is a polynomial over a
+    power of E, built by polynomial arithmetic in x. With `texts`, also the Rocq source certificate_module writes
+    them in: the polynomials in Horner form about the middle of the wall, and m and W and their jets through E's
+    jets and the polynomials N, E^2 W and their companions, as the cluster integral gives them, which floating point
+    evaluates without the cancellation of their expanded forms."""
+    X = sp.Symbol("x", real=True)
+    dl = sp.Symbol("dl", real=True)
+    n = len(g) - 1
+
+    def bp(co):
+        return sp.Poly(sum((sp.Rational(c) * math.comb(n, k) * X ** k * (1 - X) ** (n - k) for k, c in enumerate(co)),
+                           sp.Integer(0)), X, domain="QQ")
+
+    G, V, U, Q = bp(g), bp(v), bp(u), bp(q)
+    one = sp.Poly(1, X, domain="QQ")
+    rx = sp.Poly(1 + X, X, domain="QQ")
+    G1 = G.diff(X)
+    N1 = (rx * (-G1)).integrate()  # N = lam N1 + lam^2 N2, N(x) = int_0^x (1 + t) E E_t dt
+    N2 = (rx * G * G1).integrate()
+    E = one - lam * G
+    N = lam * N1 + lam ** 2 * N2
+    Nl = N1 + 2 * lam * N2  # dN / d lam
+    M, Ml = N.eval(1), Nl.eval(1)
+    rate = -3 * kappa * a * M / Ml
+    Ex = E.diff(X)
+    to_r = {X: SR - 1}
+
+    def frac(p, k):
+        """p / E^k as an expression in r."""
+        e = p.as_expr().subs(to_r)
+        return e / E.as_expr().subs(to_r) ** k if k else e
+
+    def quotient(p, k):
+        """The derivative of p / E^k: (p' E - k p E') / E^(k + 1)."""
+        return p.diff(X) * E - k * p * Ex, k + 1
+
+    # m = N / E^2, m_lam = (N_lam E + 2 N g) / E^3 since dE / d lam = -g
+    mr = quotient(N, 2)
+    ml = (Nl * E + 2 * N * G, 3)
+    w, wr = (a * V, 2), quotient(a * V, 2)
+    wl = (2 * a * V * G, 3)
+    out = {"E": frac(E, 0), "E_r": frac(Ex, 0), "E_rr": frac(Ex.diff(X), 0), "E_u": frac(-G * rate, 0),
+           "E_ru": frac(-G1 * rate, 0),
+           "e": frac(a * Q, 0), "e_r": frac(a * Q.diff(X), 0), "e_rr": frac(a * Q.diff(X).diff(X), 0),
+           "e_u": sp.Integer(0), "e_ru": sp.Integer(0),
+           "m": frac(N, 2), "m_r": frac(*mr), "m_rr": frac(*quotient(*mr)), "m_u": frac(ml[0] * rate, 3),
+           "m_ru": frac(*quotient(ml[0] * rate, 3)),
+           "W": frac(*w), "W_r": frac(*wr), "W_rr": frac(*quotient(*wr)), "W_u": frac(wl[0] * rate, 3),
+           "W_ru": frac(*quotient(wl[0] * rate, 3)),
+           "U": frac(a * U, 0), "U_r": frac(a * U.diff(X), 0), "U_rr": frac(a * U.diff(X).diff(X), 0),
+           "U_u": sp.Integer(0), "U_ru": sp.Integer(0)}
+    xr = SR - 1
+    Ed = 1 - dl * G.as_expr().subs(X, xr)
+    Md = dl * N1.eval(1) + dl ** 2 * N2.eval(1)
+    evo = {"param": dl, "at": lam, "rate": -3 * kappa * a * Md / sp.diff(Md, dl), "E": Ed,
+           "m": (dl * N1.as_expr() + dl ** 2 * N2.as_expr()).subs(X, xr) / Ed ** 2,
+           "W": a * V.as_expr().subs(X, xr) / Ed ** 2}
+    if not texts:
+        return out, M, evo
+
+    def ct(p):
+        # Horner form in 2 r - 3, which runs over [-1, 1] on the wall, with integer coefficients over one denominator
+        coeffs = sp.Poly(sp.expand(p.as_expr().subs(X, (sp.Symbol("y") + 1) / 2)), sp.Symbol("y")).all_coeffs()
+        den = 1
+        for co in coeffs:
+            den = sp.ilcm(den, sp.Rational(co).q)
+        body = sp.Integer(0)
+        for co in coeffs:
+            body = body * sp.Symbol("(2 * r - 3)", real=True) + sp.Rational(co) * den
+        return rocq_expr(body) if den == 1 else "%s / %d" % (rocq_expr(body), den)
+
+    # the polynomials, each with the Rocq source of its derivative where a jet's derivative needs it
+    aux = [("pG", ct(G), "pG1 r"), ("pG1", ct(G1), None), ("pN", ct(N), "r * j_E r * j_E_r r"),
+           ("pN1", ct(N1), None), ("pN2", ct(N2), None), ("pNl", ct(Nl), "r * pK r"),
+           ("pK", ct(2 * lam * G * G1 - G1), None), ("pV", ct(a * V), "pV1 r"), ("pV1", ct(a * V.diff(X)), "pV2 r"),
+           ("pV2", ct(a * V.diff(X).diff(X)), None)]
+    E2, E3, E4 = "(j_E r * j_E r)", "(j_E r ^ 3)", "(j_E r ^ 4)"
+    m, m_r = "(pN r / %s)" % E2, "(j_E_r r * (r - 2 * (pN r / %s)) / j_E r)" % E2
+    jet = {"E": ct(E), "E_r": ct(Ex), "E_rr": ct(Ex.diff(X)), "E_u": "- (rate_u * pG r)", "E_ru": "- (rate_u * pG1 r)",
+           "e": ct(a * Q), "e_r": ct(a * Q.diff(X)), "e_rr": ct(a * Q.diff(X).diff(X)),
+           "U": ct(a * U), "U_r": ct(a * U.diff(X)), "U_rr": ct(a * U.diff(X).diff(X)),
+           "m": m[1:-1], "m_r": m_r[1:-1],
+           "m_rr": "(j_E_rr r * (r - 2 * %s) + j_E_r r * (1 - 2 * %s)) / j_E r - j_E_r r * j_E_r r * (r - 2 * %s) / %s"
+                   % (m, m_r, m, E2),
+           "m_u": "rate_u * (pNl r / %s + 2 * pN r * pG r / %s)" % (E2, E3),
+           "m_ru": "rate_u * (r * pK r / %s - 2 * pNl r * j_E_r r / %s + 2 * (r * j_E r * j_E_r r * pG r + pN r * pG1 r)"
+                   " / %s - 6 * pN r * pG r * j_E_r r / %s)" % (E2, E3, E3, E4),
+           "W": "pV r / %s" % E2, "W_r": "pV1 r / %s - 2 * pV r * j_E_r r / %s" % (E2, E3),
+           "W_rr": "pV2 r / %s - 4 * pV1 r * j_E_r r / %s - 2 * pV r * j_E_rr r / %s + 6 * pV r * (j_E_r r * j_E_r r)"
+                   " / %s" % (E2, E3, E3, E4),
+           "W_u": "rate_u * (2 * pV r * pG r / %s)" % E3,
+           "W_ru": "rate_u * (2 * (pV1 r * pG r + pV r * pG1 r) / %s - 6 * pV r * pG r * j_E_r r / %s)" % (E3, E4),
+           "H0": "1 - 2 * %s / r" % m, "rho": "2 * %s / (r * r)" % m_r}
+    # the evolution at fixed shapes through the same polynomials, and the identities that tie them to the jets
+    L0 = rocq_expr(lam)
+    n1, n2 = rocq_expr(N1.eval(1)), rocq_expr(N2.eval(1))
+    evolution = {"pE": "1 - dl * pG r", "pm": "(dl * pN1 r + dl ^ 2 * pN2 r) / (pE dl r * pE dl r)",
+                 "pW": "pV r / (pE dl r * pE dl r)",
+                 "rate": "- (3 * %s * %s * (dl * %s + dl ^ 2 * %s)) / (%s + 2 * dl * %s)" % (
+                     rocq_expr(kappa), rocq_expr(a), n1, n2, n1, n2)}
+    splits = [("E_split", "j_E r = 1 - %s * pG r" % L0, ["j_E", "pG"]),
+              ("N_split", "pN r = %s * pN1 r + %s ^ 2 * pN2 r" % (L0, L0), ["pN", "pN1", "pN2"]),
+              ("Nl_split", "pNl r = pN1 r + 2 * %s * pN2 r" % L0, ["pNl", "pN1", "pN2"])]
+    return out, M, evo, {"aux": aux, "consts": [("rate_u", rocq_expr(rate))], "jets": jet,
+                         "evolution": evolution, "splits": splits}
 
 
 def flight_tensor(kappa):
@@ -7035,21 +7988,41 @@ def closed_shell(family, jets, keys=None):
     return gen, {k: sp.cancel(sp.together(gen[k].subs(table))) for k in (family_keys if keys is None else keys)}
 
 
-def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201, nth=81):
+def rocket_frame(xs, H, q):
+    """The components of a rocket shell on the frame (q k + l/q)/sqrt2, (q k - l/q)/sqrt2, e_th, e_ph, as Rocq terms,
+    from its null-frame components xs in ROCKET_KEYS order and Rocq terms for H = 2 q^2 and q."""
+    ckk, ckl, cll, ck2, cl2, c22, c33 = xs
+    return {"E": "(%s * (%s) / 2 + 2 * (%s) + 2 * (%s) / %s) / 2" % (H, ckk, ckl, cll, H),
+            "a": "(%s * (%s) / 2 - 2 * (%s) / %s) / 2" % (H, ckk, cll, H),
+            "d": "(%s * (%s) / 2 + %s) / %s" % (H, ck2, cl2, q),
+            "S": "(%s * (%s) / 2 - 2 * (%s) + 2 * (%s) / %s) / 2" % (H, ckk, ckl, cll, H),
+            "x": "(%s * (%s) / 2 - (%s)) / %s" % (H, ck2, cl2, q), "T": c22, "P": c33}
+
+
+def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, exterior=None, mass=None, rocket=None,
+                       texts=None, nr=201, nth=81):
     """The Rocq module proving the four energy conditions for a closed-form shell on 1 <= r <= 2, with the exact
     margins and the least certificate rows on a grid of nr radii and nth angles over the wall, which the trees of the
-    module give, the rows relative to rho, those of lam eta - T eta T to rho^2."""
+    module give, the rows relative to rho, those of lam eta - T eta T to rho^2. `texts`, from rocket_bern_jets, gives
+    the Rocq source of the jets, H0 and rho, and the polynomials they are written through. With `exterior`, the profiles outside
+    a drag shell of mass `mass`, the module also proves its flat cavity and that exterior empty, the wall's jets
+    matched to theirs to first order at both faces, and so the conditions at every point off the centre; with
+    `rocket`, a rocket shell's depth, acceleration and kappa, the same for its cavity and its exhaust."""
     fn, argnames, keys = FAMILIES[family]
     jetnames = [a for a in argnames if a not in ("r", "c", "s", "b", "b_t")]
     gen, _ = closed_shell(family, jets, ())
     # a jet that vanishes on this shell is zero in G_*, and one equal on it to an earlier jet is that jet there, with no
     # definition or derivative of its own; G_* name the rest
     same = {}
+    probe = [sp.Rational(k, 7) + 1 for k in (1, 3, 6)]
+    sample = {nm: [complex(sp.N(jets[nm].subs(SR, p), 30)) for p in probe] for nm in jetnames}
     for i, nm in enumerate(jetnames):
         if jets[nm] == 0:
             same[nm] = 0
         else:
-            twin = next((o for o in jetnames[:i] if o not in same and sp.cancel(jets[o] - jets[nm]) == 0), None)
+            twin = next((o for o in jetnames[:i] if o not in same
+                         and all(abs(x - y) <= 1e-20 * (1 + abs(x)) for x, y in zip(sample[o], sample[nm]))
+                         and sp.cancel(jets[o] - jets[nm]) == 0), None)
             if twin is not None:
                 same[nm] = twin
     live = [nm for nm in jetnames if nm not in same]
@@ -7065,77 +8038,162 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
             ", ".join(a for a, _ in pairs)), pairs)) if present)
     tag = {k: ("%d%d" % k if isinstance(k, tuple) else k) for k in keys}
     forms = {name: (params.split(), body) for name, (params, body) in SECTION_FORMS.items()}
-    L = ["(* %s" % note, "",
-         "   G_* are the components of 8 pi T for the %s family in terms of the jets of its profile" % family,
-         "   functions, and j_* the jets of this shell.  Proved here: the null, weak, strong and dominant energy",
-         "   conditions for every observer at every point of the wall, and that the radial jets are derivatives",
-         "   of one another.%s *)" % reduced, "Module %s." % module, ""]
+    proved = (["   conditions for every observer at every point off the centre, in the wall and in the empty cavity and",
+               "   exterior that the wall meets to first order, and that the radial jets are derivatives of one another."]
+              if exterior else
+              ["   conditions for every observer at every point off the centre, in the wall, in the empty cavity and in",
+               "   the exhaust outside, that the radial jets are derivatives of one another and that those in u are",
+               "   the ones the exhaust's evolution gives."] if rocket else
+              ["   conditions for every observer at every point of the wall, and that the radial jets are derivatives",
+               "   of one another."])
+    L = ["(* %s" % note, ""] + (
+        ["   G_* are the components of 8 pi T for the drag family in terms of the jets of its profile functions,",
+         "   each the sum of its parts G_*_jl times cos th ^ j and sin th ^ l, and j_* the jets of this shell.  Proved",
+         "   here: the null, weak, strong and dominant energy"] if family == "drag" else
+        ["   G_* are the components of 8 pi T for the rocket family on its null frame in terms of the jets of its",
+         "   profile functions, each the sum of its parts G_*_jl times cos th ^ j and sin th ^ l over a power of",
+         "   1 + e cos th, and j_* the jets of this shell.  Proved here: the null, weak, strong and dominant energy"])
+    tail = ([proved[-1], "   " + reduced.strip() + " *)"] if reduced and (exterior or rocket)
+            else [proved[-1] + reduced + " *)"])
+    L += proved[:-1] + tail + ["Module %s." % module, ""]
     binder = "(r c s %s : R)" % " ".join(live)
     # the numerators of G_* nested in c, s, r and then the jets by the order of their derivatives, which halves the
-    # operations Interval's bisection runs on each box and narrows its enclosures
+    # operations Interval's bisection runs on each box and narrows its enclosures; a drag shell's G_* are written as
+    # their radial parts, the numerator's coefficient of each power of c and s over the denominator, times those powers
     order = [SC, SS, SR] + [sp.Symbol(nm, real=True) for nm in
                             sorted(live, key=lambda nm: (len(nm.partition("_")[2]), live.index(nm)))]
+    parts = []
+    e_sym = sp.Symbol("e", real=True)
     for k in keys:
         num, den = sp.fraction(gen[k])
-        gens = [v for v in order if v in num.free_symbols]
-        forms["G_" + tag[k]] = (["r", "c", "s"] + live, "%s / %s" % (
-            rocq_expr(sp.polys.polyfuncs.horner(sp.expand(num), *gens) if gens else num), rocq_expr(den)))
+        # the angle enters a denominator only through powers of 1 + e c, the lapse's dipole in the rocket family
+        power = 0
+        while "e" in live and sp.rem(sp.expand(den), SC * e_sym + 1, SC) == 0:
+            den, power = sp.cancel(den / (SC * e_sym + 1)), power + 1
+        if den.has(SC) or den.has(SS):
+            raise ValueError("the denominator of G_%s depends on the angle otherwise: %s" % (tag[k], den))
+        poly = sp.Poly(sp.expand(num), SC, SS)
+        terms = []
+        for j, l in (DRAG_PARTS[k] if family == "drag" else sorted(poly.monoms())):
+            co = poly.coeff_monomial(SC ** j * SS ** l)
+            gens = [v for v in order[2:] if v in co.free_symbols]
+            name = "G_%s_%d%d" % (tag[k], j, l)
+            forms[name] = (["r"] + live, "%s / %s" % (
+                rocq_expr(sp.polys.polyfuncs.horner(sp.expand(co), *gens) if gens else co), rocq_expr(den)))
+            L += ["Definition %s (r %s : R) : R :=\n  %s." % (name, " ".join(live), forms[name][1])]
+            parts.append(name)
+            terms.append("c * " * j + "s * " * l + "%s r %s" % (name, " ".join(live)))
+        if family == "drag" and not set(poly.monoms()) <= set(DRAG_PARTS[k]):
+            raise ValueError("G_%s has the powers %s of c and s" % (tag[k], sorted(poly.monoms())))
+        total = " + ".join(terms) or "0"
+        forms["G_" + tag[k]] = (["r", "c", "s"] + live,
+                                "(%s) / ((1 + e * c) ^ %d)" % (total, power) if power else total)
         L += ["Definition G_%s %s : R :=\n  %s." % (tag[k], binder, forms["G_" + tag[k]][1]), ""]
-    for nm in defined:
-        forms["j_" + nm] = (["r"], rocq_frac(jets[nm], integral=True))
+    # a drag shell's lapse is (2 - psi) / psi, its jets written through psi's, and its polynomial jets in Horner form
+    # about the middle of the wall
+    through = family == "drag" and "N" in defined and sp.cancel(jets["N"] - (2 - jets["psi"]) / jets["psi"]) == 0
+    given = texts["jets"] if texts else {}
+    if texts:
+        L += ["(* the polynomials in the depth that the jets are written through, and the rate of the depth *)"]
+        for name, text, _ in texts["aux"]:
+            forms[name] = (["r"], text)
+            L.append("Definition %s (r : R) : R := %s." % (name, text))
+        for name, text in texts["consts"]:
+            forms[name] = ([], text)
+            L.append("Definition %s : R := %s." % (name, text))
+        L.append("")
+    for nm in sorted(defined, key=lambda nm: through and nm.startswith("N")):
+        if nm in given:
+            forms["j_" + nm] = (["r"], given[nm])
+        elif through and nm in LAPSE_THROUGH_PSI:
+            forms["j_" + nm] = (["r"], LAPSE_THROUGH_PSI[nm])
+        elif family == "drag" and sp.fraction(sp.cancel(jets[nm]))[1].is_number:
+            forms["j_" + nm] = (["r"], centred_text(jets[nm]))
+        else:
+            forms["j_" + nm] = (["r"], rocq_frac(jets[nm], integral=True))
         L.append("Definition j_%s (r : R) : R := %s." % (nm, forms["j_" + nm][1]))
     L.append("")
+
+    def unfolding(names):
+        """The definitions that names are written through, each before those its own body names."""
+        order, seen = [], set()
+
+        def visit(nm):
+            if nm in seen or nm not in forms:
+                return
+            seen.add(nm)
+            for token in re.findall(r"[A-Za-z_][\w']*", forms[nm][1]):
+                visit(token)
+            order.append(nm)
+
+        for nm in names:
+            visit(nm)
+        return order[::-1]
+
     jl = " ".join("(j_%s r)" % nm for nm in live)
     xs = {k: "G_%s r (cos th) (sin th) %s" % (tag[k], jl) for k in keys}
     if family == "drag":
         body = dict(zip(ORTHO, [xs[k] for k in keys]))
     else:
+        forms["H0"] = (["r"], given.get("H0") or rocq_frac(H0))
         L += ["(* the frame is (q k + l/q)/sqrt2, (q k - l/q)/sqrt2, e_th, e_ph with q^2 = H0/2 *)",
-              "Definition H0 (r : R) : R := %s." % rocq_frac(H0), "",
-              "Lemma H0_positive r : 1 <= r <= 2 -> 0 < H0 r.", "Proof. intros Hr. unfold H0. interval. Qed.", ""]
-        forms["H0"] = (["r"], rocq_frac(H0))
-        ckk, ckl, cll, ck2, cl2, c22, c33 = [xs[k] for k in keys]
-        body = {"E": "(H0 r * (%s) / 2 + 2 * (%s) + 2 * (%s) / H0 r) / 2" % (ckk, ckl, cll),
-                "a": "(H0 r * (%s) / 2 - 2 * (%s) / H0 r) / 2" % (ckk, cll),
-                "d": "(H0 r * (%s) / 2 + %s) / sqrt (H0 r)" % (ck2, cl2),
-                "S": "(H0 r * (%s) / 2 - 2 * (%s) + 2 * (%s) / H0 r) / 2" % (ckk, ckl, cll),
-                "x": "(H0 r * (%s) / 2 - (%s)) / sqrt (H0 r)" % (ck2, cl2), "T": c22, "P": c33}
+              "Definition H0 (r : R) : R := %s." % forms["H0"][1], ""]
+        body = rocket_frame([xs[k] for k in keys], "H0 r", "sqrt (H0 r)")
     L.append("(* the components on this shell at radius r and polar angle th *)")
     for k in ORTHO:
         L.append("Definition t%s (r th : R) : R := %s." % (k, body[k]))
         forms["t" + k] = (["r", "th"], body[k])
-    forms.update(rho=(["r"], rocq_frac(rho)), mu=(["r"], "%s * rho r" % rocq_expr(k1)),
-                 lam=(["r"], "%s * (rho r * rho r)" % rocq_expr(k2)))
-    L += [""] + ["Definition %s (r : R) : R := %s." % (name, forms[name][1]) for name in ("rho", "mu", "lam")] + [""]
-    # Interval's trees of the density and the components, which the rows' trees name
-    L.append("(* the trees of rho and of the components, of which the rows' trees are built *)")
-    shared, value = {}, {}
+    forms["rho"] = (["r"], given.get("rho") or rocq_frac(rho))
+    vary = isinstance(k1, (list, tuple))
+    if vary:
+        # mu = E k1 and lam = E^2 k2, each k a polynomial in the depth and cos th^2
+        def over_wall(k):
+            terms = ("", " * (r - 1)", " * ((r - 1) * (r - 1))", " * (cos th * cos th)", " * cos th")
+            return " + ".join(rocq_expr(co) + t for co, t in zip(k, terms) if co != 0) or "0"
+
+        forms.update(mu=(["r", "th"], "tE r th * (%s)" % over_wall(k1)),
+                     lam=(["r", "th"], "(tE r th * tE r th) * (%s)" % over_wall(k2)))
+        L += ["", "(* the multipliers of the certificate, the energy density times a polynomial over the wall *)"]
+        L += ["Definition %s (r th : R) : R := %s." % (name, forms[name][1]) for name in ("mu", "lam")] + [""]
+        mu, lam = "mu r th", "lam r th"
+    else:
+        forms.update(mu=(["r"], "%s * rho r" % rocq_expr(k1)), lam=(["r"], "%s * (rho r * rho r)" % rocq_expr(k2)))
+        L += [""] + ["Definition %s (r : R) : R := %s." % (name, forms[name][1]) for name in ("rho", "mu", "lam")] + [""]
+        mu, lam = "mu r", "lam r"
+    applied = section_applied(mu, lam)
     rg, thg = np.meshgrid(wall_radii(1.0, 2.0, nr), np.linspace(0.0, np.pi, nth), indexing="ij")
     wall = (rg, thg)
-    for name in ["rho"] + (["H0"] if "H0" in forms else []) + ["t" + k for k in ORTHO]:
-        params, text = forms[name]
-        tree = term_tree(text, forms, dict(zip(params, WALL)), shared)
-        shared[name] = "tree_" + (name[1:] if name[0] == "t" else name)
-        value[shared[name]] = tree_value(tree, wall, value) + np.zeros(rg.shape)
-        L.append("Definition %s : Tree.expr := %s." % (shared[name], tree_text(tree)))
-    L.append("")
-    rows, density = {}, value["tree_rho"]
-    for nm, stmt in CERTIFICATE_ROWS:
-        stmt = stmt.format(**SECTION_APPLIED)
-        tree = term_tree(stmt, forms, {"r": WALL[0], "th": WALL[1]}, shared)
-        if nm not in ("m", "l"):
-            rows[nm] = float((tree_value(tree, wall, value) / density ** (2 if nm[0] == "d" else 1)).min())
-        L += ["Lemma row_%s r th : 1 <= r <= 2 -> 0 <= th <= PI -> 0 <= %s." % (nm, stmt),
-              "Proof. wall %s r th. Qed." % tree_text(tree), ""]
+    value = {}
+    for k in ORTHO:
+        value["tree_" + k] = tree_value(term_tree(forms["t" + k][1], forms, dict(zip(["r", "th"], WALL))), wall, {})
+        value["tree_" + k] = value["tree_" + k] + np.zeros(rg.shape)
+    density = tree_value(term_tree(forms["rho"][1], forms, {"r": WALL[0]}), wall, value) + np.zeros(rg.shape)
+    rows = {}
+    # the radial functions are the parts of G_* at this shell's jets, rho where the multipliers take it, and for a
+    # rocket shell H0, which a row of its own holds above half its least value on the grid, and the lapse's dipole e
+    atoms = parts + ([] if vary else ["rho"]) + (["H0"] if family == "rocket" else []) + (
+        ["j_e"] if "e" in live else [])
+    extra = []
+    if family == "rocket":
+        low = sp.Rational(int(float(tree_value(term_tree(forms["H0"][1], forms, {"r": WALL[0]}), wall, {}).min())
+                              * 500000), 1000000)
+        if low <= 0:
+            raise ValueError("H0 is not positive on the wall of %s" % module)
+        extra.append(("H0", "H0 r - %s" % rocq_expr(low)))
+    L += radial_lines(forms, live, atoms, applied, through, rows, wall, density, extra)
+    if family == "rocket":
+        L += ["Lemma H0_positive r : 1 <= r <= 2 -> 0 < H0 r.",
+              "Proof. intros Hr. pose proof (row_H0 r 0 Hr (conj (Rle_refl 0) (Rlt_le _ _ PI_RGT_0))). lra. Qed.", ""]
     allg = " ".join("(t%s r th)" % k for k in ORTHO)
     L += ["(* every energy condition, for every observer, at every point of the wall *)",
           "Theorem shell_energy_conditions r th : 1 <= r <= 2 -> 0 <= th <= PI -> energy_conditions %s." % allg,
-          "Proof.", "  intros Hr Hth.", "  apply (certified %s (mu r) (lam r))." % allg]
+          "Proof.", "  intros Hr Hth.", "  apply (certified %s (%s) (%s))." % (allg, mu, lam)]
     L += ["  - pose proof (row_%s r th Hr Hth). lra." % nm for nm, _ in CERTIFICATE_ROWS] + ["Qed.", ""]
+    L += einstein_bridge(family, forms, live, same, keys, tag)
     E, a, d, S, x, T, P = (value["tree_" + k] for k in ORTHO)
     z = np.zeros(rg.shape)
     Tab = np.stack([np.stack(row, -1) for row in ([E, a, d, z], [a, S, x, z], [d, x, T, z], [z, z, z, P])], -2)
-    if family == "rocket":
+    if family == "rocket" and not rocket:
         L += ["(* outside the wall the solution is Kinnersley's photon rocket: null dust whose density is a",
               "   positive multiple of -(m_u + 3 m a c), with m_u = -3 kappa a m on this shell *)",
               "Lemma exhaust_nonnegative m a kappa c :",
@@ -7143,21 +8201,411 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
               "Proof.", "  intros Hm Ha Hk Hc. assert (0 <= m * a) by (apply Rmult_le_pos; assumption). nra.", "Qed.", ""]
     L.append("(* the radial jets are derivatives of one another *)")
     der = {"": "_r", "_r": "_rr", "_u": "_ru"}
+    pairs = []
     for nm in defined:
         base = nm.rsplit("_", 1)
         suf = "_" + base[1] if len(base) == 2 and base[1] in ("r", "u") else ""
         root = nm[: len(nm) - len(suf)] if suf else nm
         if suf in der and root + der[suf] in defined:
-            L += ["Lemma j_%s_derive r : 1 <= r <= 2 -> is_derive j_%s r (j_%s r)." % (nm, nm, root + der[suf]),
-                  "Proof.", "  intros Hr. unfold j_%s, j_%s. auto_derive; [ nonzero r | field; nonzero r ]." % (nm, root + der[suf]),
-                  "Qed.", ""]
+            pairs.append((nm, root + der[suf]))
+
+    def named(text):
+        return {t for t in re.findall(r"[A-Za-z_][\w']*", text) if t in forms}
+
+    # a jet written through the polynomials is differentiated with them held as functions whose derivatives are
+    # known, so that field meets only those functions' values
+    through_polys = [p for p in pairs if texts and named(forms["j_" + p[0]][1])]
+    for nm, d in pairs:
+        if (nm, d) not in through_polys:
+            L += ["Lemma j_%s_derive r : 1 <= r <= 2 -> is_derive j_%s r (j_%s r)." % (nm, nm, d),
+                  "Proof.", "  intros Hr. unfold %s. auto_derive; [ nonzero r | field; nonzero r ]." % ", ".join(
+                      unfolding(["j_" + nm, "j_" + d])), "Qed.", ""]
+    if through_polys:
+        known = [(name, name + "_derive") for name, _, deriv in texts["aux"] if deriv]
+        known += [("j_" + nm, "j_%s_derive" % nm) for nm, d in pairs if (nm, d) not in through_polys]
+        L += ["(* the polynomials' derivatives *)",
+              "Lemma j_E_pos r : 1 <= r <= 2 -> 0 < j_E r.",
+              "Proof. intros Hr. unfold j_E. interval with (i_bisect r). Qed.", ""]
+        for name, _, deriv in texts["aux"]:
+            if deriv:
+                L += ["Lemma %s_derive r : 1 <= r <= 2 -> is_derive %s r (%s)." % (name, name, deriv),
+                      "Proof.", "  intros Hr. unfold %s. auto_derive; [ nonzero r | field; nonzero r ]." % ", ".join(
+                          unfolding([name] + sorted(named(deriv)))), "Qed.", ""]
+        # each side goal is matched on its function's name, so that no lemma is tried against another's polynomial
+        L += ["Ltac jet_nz := first [ exact I | apply Rgt_not_eq; lra | apply Rlt_not_eq; lra",
+              "  | apply Rmult_integral_contrapositive_currified; jet_nz | apply pow_nonzero; jet_nz",
+              "  | apply Rgt_not_eq; apply j_E_pos; lra ].",
+              "Ltac jet_ex := match goal with",
+              ] + ["  | |- ex_derive (fun x => %s x) _ => eexists; apply %s; lra" % (f, lemma) for f, lemma in known] + [
+              "  end.",
+              "Ltac jet_side := repeat split; first [ exact I | jet_ex | jet_nz ].", ""]
+        for nm, d in through_polys:
+            fns = sorted(named(forms["j_" + nm][1]))
+            L += ["Lemma j_%s_derive r : 1 <= r <= 2 -> is_derive j_%s r (j_%s r)." % (nm, nm, d),
+                  "Proof.", "  intros Hr. unfold j_%s, j_%s. auto_derive; [ jet_side |]." % (nm, d)]
+            rewrites = ["?(is_derive_unique (fun x : R => %s x) r _ (%s r Hr))" % (f, lemma) for f, lemma in known
+                        if f in fns]
+            L += ["  rewrite %s." % ", ".join(rewrites)] if rewrites else []
+            L += ["  field; repeat split; jet_nz.", "Qed.", ""]
+    if exterior:
+        L += join_lines(jets, live, keys, tag, exterior, mass, parts)
+    if rocket:
+        L += rocket_join_lines(jets, live, keys, tag, parts=parts, unfolding=unfolding, texts=texts, **rocket)
     return L + ["End %s." % module, ""], worst_margins(Tab), rows
+
+
+# the powers c^j s^l of the parts of a drag shell's G_*, by component
+DRAG_PARTS = {(0, 0): ((0, 0), (2, 0)), (0, 1): ((1, 0),), (0, 2): ((0, 1),), (1, 1): ((0, 0), (2, 0)),
+              (1, 2): ((1, 1),), (2, 2): ((0, 0), (2, 0)), (3, 3): ((0, 0), (2, 0))}
+# a lapse N = (2 - psi) / psi and its derivatives, through psi's jets
+LAPSE_THROUGH_PSI = {"N": "2 / j_psi r - 1", "N_r": "(-2) * j_psi_r r / (j_psi r * j_psi r)",
+                     "N_rr": "(4 * (j_psi_r r * j_psi_r r) - 2 * (j_psi r * j_psi_rr r)) / (j_psi r ^ 3)"}
+# the cells of r the two-level bisection may cut a wall into, as halvings, and the depth of its bisection in th
+RADIAL_DEPTHS = (16, 7)
+
+
+def centred_text(e):
+    """Rocq source for a polynomial in r in Horner form about the middle of the wall, r = 3/2."""
+    y = sp.Symbol("(r - 3 / 2)", real=True)
+    p = sp.Poly(sp.expand(sp.cancel(e).subs(SR, y + sp.Rational(3, 2))), y)
+    out = sp.Integer(0)
+    for co in p.all_coeffs():
+        out = out * y + co
+    return rocq_expr(out)
+
+
+def straight_line(trees, nvars=1):
+    """A straight-line program of Interval's Prog computing the trees in turn, each subterm once, their values left at
+    the top of the value list in order, and its constants, the trees of the constant arguments: Rocq source of both."""
+    intern, memo, cmemo = {}, {}, {}
+
+    def key(t):
+        if id(t) not in memo:
+            kind = t[0]
+            k = (kind, t[1]) if kind in ("int", "var") else (kind, t[1], key(t[2])) if kind in ("pow", "op1") else \
+                (kind, t[1], key(t[2]), key(t[3]))
+            memo[id(t)] = intern.setdefault(k, len(intern))
+        return memo[id(t)]
+
+    def constant(t):
+        if id(t) not in cmemo:
+            cmemo[id(t)] = t[0] == "int" or (t[0] != "var" and all(constant(c) for c in t[2:]))
+        return cmemo[id(t)]
+
+    ops, position, consts, cindex = [], {}, [], {}
+
+    def visit(t):
+        if t[0] == "var":
+            return ("var", t[1])
+        k = key(t)
+        if constant(t):
+            if k not in cindex:
+                cindex[k] = len(consts)
+                consts.append(t)
+            return ("const", cindex[k])
+        if k not in position:
+            args = [visit(c) for c in t[2:]] if t[0] in ("pow", "op1") else [visit(t[2]), visit(t[3])]
+            position[k] = len(ops)
+            ops.append((t[0], t[1], args))
+        return ("val", position[k])
+
+    roots = [visit(t) for t in trees]
+    ops += [("fwd", None, [root]) for root in reversed(roots)]
+    text = []
+    for i, (kind, op, args) in enumerate(ops):
+        ix = [i - 1 - v if where == "val" else i + v if where == "var" else i + nvars + v for where, v in args]
+        text.append("Prog.Forward %d" % ix[0] if kind == "fwd" else
+                    "Prog.Unary (Tree.PowerInt %d) %d" % (op, ix[0]) if kind == "pow" else
+                    "Prog.Unary Tree.%s %d" % (op, ix[0]) if kind == "op1" else
+                    "Prog.Binary Tree.%s %d %d" % (op, ix[0], ix[1]))
+    return text, [tree_text(c) for c in consts]
+
+
+def radial_lines(forms, live, atoms, applied, through, rows, wall, density, extra=()):
+    """The lemmas of a shell's module proving its certificate's rows by the two-level bisection: the trees of its
+    jets and of its radial functions `atoms`, the parts of G_* and the functions of r alone the components take
+    besides, the program computing them, the rows' trees with the radial functions their variables from 2 on, and
+    the rows, those of CERTIFICATE_ROWS and then `extra`. Each certificate row's least value on the grid `wall`,
+    relative to the density or its square, goes into `rows`."""
+    jl = " ".join("(j_%s r)" % nm for nm in live)
+    args = {name: "%s r %s" % (name, jl) if name.startswith("G_") else "%s r" % name for name in atoms}
+    refs = {"j_" + nm: "tree_j_" + nm for nm in live}
+    L = ["(* the trees of the jets and of the radial functions, the parts of G_* at the jets, the program of Interval",
+         "   that computes them, and the trees of the rows, whose variables from 2 on are those functions *)"]
+    done = {}
+    for nm in sorted(live, key=lambda nm: through and nm.startswith("N")):
+        tree = term_tree(forms["j_" + nm][1], forms, {"r": WALL[0]}, {k: v for k, v in refs.items() if k[2:] in done})
+        done[nm] = True
+        L.append("Definition tree_j_%s : Tree.expr := %s." % (nm, tree_text(tree)))
+    full = [term_tree(args[name], forms, {"r": WALL[0]}) for name in atoms]
+    for name in atoms:
+        if name[2:] not in live or not name.startswith("j_"):  # a jet's tree is already written
+            L.append("Definition tree_%s : Tree.expr := %s." % (
+                name, tree_text(term_tree(args[name], forms, {"r": WALL[0]}, refs))))
+    prog, consts = straight_line(full)
+    L += ["Definition radial_prog : list Prog.term := (%s :: nil)%%list." % " :: ".join(prog),
+          "Definition radial_constants : list Tree.expr := (%s :: nil)%%list." % " :: ".join(consts),
+          "Definition radial_atoms : list Tree.expr := (%s :: nil)%%list." % " :: ".join("tree_" + n for n in atoms)]
+    shared = dict(refs, **{name: "atom%d" % i for i, name in enumerate(atoms)})
+    standard = (WALL[0],) + tuple(("ref", shared["j_" + nm]) for nm in live)
+
+    # a row's variables are th, then r, then the radial functions
+    def as_variables(t):
+        if t[0] == "ref":
+            return ("var", 2 + int(t[1][4:]))
+        if t[0] == "var":
+            return ("var", 1 - t[1])
+        if t[0] == "int":
+            return t
+        return (t[0], t[1]) + tuple(as_variables(c) for c in t[2:])
+
+    radial = [tree_value(t, wall, {}) + np.zeros(wall[0].shape) for t in full]
+    trees, stmts = [], []
+    for nm, stmt in list(CERTIFICATE_ROWS) + list(extra):
+        stmt = stmt.format(**applied)
+        tree = as_variables(term_tree(stmt, forms, {"r": WALL[0], "th": WALL[1]}, shared, standard))
+        if nm not in ("m", "l") and nm in dict(CERTIFICATE_ROWS):
+            rows[nm] = float((tree_value(tree, [wall[1], wall[0]] + radial, {}) /
+                              density ** (2 if nm[0] == "d" else 1)).min())
+        trees.append(tree)
+        stmts.append((nm, stmt))
+    outer, depth = RADIAL_DEPTHS
+    L += ["Definition radial_rows : list Tree.expr := (%s :: nil)%%list." % " :: ".join(tree_text(t) for t in trees), "",
+          "Lemma radial_ok : radial_check %d %d radial_prog radial_constants radial_atoms radial_rows = true." % (outer, depth),
+          "Proof. rewrite <- Fast.fradial_check_eq. vm_cast_no_check (eq_refl true). Qed.", "",
+          "Lemma radial_atoms_eq r : map (fun e => Tree.eval e (r :: nil)) radial_atoms = (%s :: nil)%%list." % " :: ".join(
+              args[name] for name in atoms), "Proof. reflexivity. Qed.", ""]
+    for k, (nm, stmt) in enumerate(stmts):
+        L += ["Lemma row_%s r th : 1 <= r <= 2 -> 0 <= th <= PI -> 0 <= %s." % (nm, stmt),
+              "Proof.", "  intros Hr Hth.", "  generalize (radial_nonneg %d %d radial_prog radial_constants radial_atoms"
+              " radial_rows radial_ok r th Hr Hth %d ltac:(simpl; lia))." % (outer, depth, k),
+              "  rewrite radial_atoms_eq. exact (fun h => h).", "Qed.", ""]
+    return L
+
+
+def rocket_join_lines(jets, live, keys, tag, evolution, accel, kappa, parts=(), unfolding=None, texts=None):
+    """The lemmas of a rocket shell's module on its evolution, its flat cavity and its exhaust: the jets in u are the
+    rate of the depth times the derivatives of the profiles in it, `evolution` giving the profiles E, m and W as
+    functions of the depth and its rate; the cavity holds the wall's E at r = 1 and is empty; outside, Kinnersley's
+    photon rocket carries null dust of non-negative density; and at each face g_uu and g_uth meet to first order and
+    g_ur to zeroth. `unfolding` lists the definitions that given ones are written through, and `texts`, from
+    rocket_bern_jets, writes the evolution through the jets' polynomials and the identities that tie them."""
+    def unfold(*names):
+        return ", ".join(unfolding(list(names)) if unfolding else names)
+
+    dl = sp.Symbol("dl", real=True)
+    fam = {nm: evolution[nm].subs(evolution["param"], dl) for nm in ("E", "m", "W")}
+    rate = sp.cancel(evolution["rate"].subs(evolution["param"], dl))
+
+    def two(e):
+        num, den = sp.fraction(sp.together(e))
+        return rocq_expr(sp.expand(num)) if den == 1 else "%s / %s" % (rocq_expr(sp.expand(num)), rocq_expr(den))
+
+    M, Mu = (sp.cancel(jets[nm].subs(SR, 2)) for nm in ("m", "m_u"))
+    if sp.cancel(Mu + 3 * kappa * accel * M) != 0:
+        raise ValueError("the rocket shell's exhaust does not carry mass away at kappa times 3 a M")
+    dipole = "e" in live
+    inside = {"E": "cav_E", "E_u": "cav_E_u"}
+    outside = {"E": "1", "m": "ext_M", "m_u": "ext_M_u", "W": "(ext_a * r)", "W_r": "ext_a", "U": "ext_a"}
+    d0 = rocq_expr(evolution["at"])
+    L = ["(* the jets in u are those of the evolution the exhaust gives the family: its depth dl follows",
+         "   d dl / du = - 3 kappa a M / (dM / d dl), at constant acceleration, with M the mass at r = 2, so that the",
+         "   exhaust carries mass away at kappa times the least rate 3 a M *)"]
+    if texts:
+        polys = [name for name, _, _ in texts["aux"]]
+        L += ["Definition %s (dl r : R) : R := %s." % (nm, texts["evolution"][nm]) for nm in ("pE", "pm", "pW")]
+        L += ["Definition rate (dl : R) : R := %s." % texts["evolution"]["rate"], ""]
+        for name, stmt, names in texts["splits"]:
+            L += ["Lemma %s r : %s." % (name, stmt), "Proof. unfold %s. field. Qed." % ", ".join(names), ""]
+        L += ["Lemma jets_now r : 1 <= r <= 2 -> j_E r = pE %s r /\\ j_m r = pm %s r /\\ j_W r = pW %s r." % (d0, d0, d0),
+              "Proof.", "  intros Hr. unfold j_m, j_W, pm, pW, pE. rewrite N_split, E_split.",
+              "  repeat split; field; unfold %s; nonzero r." % ", ".join(polys), "Qed.", "",
+              "Lemma jets_in_u r : 1 <= r <= 2 ->",
+              "  is_derive (fun dl => pE dl r) %s (j_E_u r / rate %s) /\\" % (d0, d0),
+              "  is_derive (fun dl => pm dl r) %s (j_m_u r / rate %s) /\\" % (d0, d0),
+              "  is_derive (fun dl => pW dl r) %s (j_W_u r / rate %s)." % (d0, d0),
+              "Proof.", "  intros Hr. unfold pm, pW, pE, rate, j_E_u, j_m_u, j_W_u, rate_u.",
+              "  rewrite N_split, Nl_split, E_split.",
+              "  refine (conj _ (conj _ _)); (auto_derive; [ unfold %s; nonzero r | field; unfold %s; nonzero r ])."
+              % (", ".join(polys), ", ".join(polys)), "Qed.", ""]
+    else:
+        L += ["Definition pE (dl r : R) : R := %s." % two(fam["E"]),
+              "Definition pm (dl r : R) : R := %s." % two(fam["m"]),
+              "Definition pW (dl r : R) : R := %s." % two(fam["W"]),
+              "Definition rate (dl : R) : R := %s." % two(rate), "",
+              "Lemma jets_now r : 1 <= r <= 2 -> j_E r = pE %s r /\\ j_m r = pm %s r /\\ j_W r = pW %s r." % (d0, d0, d0),
+              "Proof. intros Hr. unfold %s, pE, pm, pW. repeat split; field; nonzero r. Qed." % unfold(
+                  "j_E", "j_m", "j_W"), "",
+              "Lemma jets_in_u r : 1 <= r <= 2 ->",
+              "  is_derive (fun dl => pE dl r) %s (j_E_u r / rate %s) /\\" % (d0, d0),
+              "  is_derive (fun dl => pm dl r) %s (j_m_u r / rate %s) /\\" % (d0, d0),
+              "  is_derive (fun dl => pW dl r) %s (j_W_u r / rate %s)." % (d0, d0),
+              "Proof.", "  intros Hr. unfold pE, pm, pW, rate, %s." % unfold("j_E_u", "j_m_u", "j_W_u"),
+              "  refine (conj _ (conj _ _)); (auto_derive; [ nonzero r | field; nonzero r ]).", "Qed.", ""]
+    L += [
+         "(* inside the wall the flat cavity, whose E is the wall's at r = 1 and depends on u alone, and outside it",
+         "   Kinnersley's photon rocket of the wall's mass M at r = 2 and acceleration a, the null dust of the exhaust *)",
+         "Definition cav_E : R := %s." % rocq_expr(sp.cancel(jets["E"].subs(SR, 1))),
+         "Definition cav_E_u : R := %s." % rocq_expr(sp.cancel(jets["E_u"].subs(SR, 1))),
+         "Definition ext_M : R := %s." % rocq_expr(M),
+         "Definition ext_M_u : R := %s." % rocq_expr(Mu),
+         "Definition ext_a : R := %s." % rocq_expr(accel),
+         "Definition ext_H0 (r : R) : R := %s." % rocq_frac(1 - 2 * M / SR, integral=True), "",
+         "Lemma ext_H0_positive r : 2 <= r -> 0 < ext_H0 r.",
+         "Proof. intros Hr. unfold ext_H0. apply Rdiv_lt_0_compat; lra. Qed.", "",
+         "Lemma exhaust_rate : j_m_u 2 = ext_M_u /\\ ext_M_u = - 3 * %s * ext_a * ext_M." % rocq_expr(kappa),
+         "Proof. unfold %s, ext_M_u, ext_a, ext_M. split; field. Qed." % unfold("j_m_u"), "",
+         "(* the metric's g_uu and g_uth, of E, %sm, W and U *)" % ("e, " if dipole else ""),
+         "Definition guu (E %sm W U r th : R) : R := - %s ^ 2 * (1 - 2 * m / r + 2 * W * cos th) + U ^ 2 * r ^ 2 * sin th ^ 2."
+         % (("e ", "(E * (1 + e * cos th))") if dipole else ("", "E")),
+         "Definition guth (U r th : R) : R := - U * r ^ 2 * sin th.", "",
+         "(* at each face the wall's g_uu and g_uth meet those inside and outside to first order and its g_ur = - %s" % (
+             "E (1 + e cos th)" if dipole else "E"),
+         "   theirs; the jump of d_r g_ur is a multiple of dr, which carries no surface layer *)"]
+    ein = "(j_e {r}) " if dipole else ""
+    zero = "0 " if dipole else ""
+    wall_g = ("guu (j_E {r}) %s(j_m {r}) (j_W {r}) (j_U {r}) {r} th" % ein, "guth (j_U {r}) {r} th")
+    sides = {1: ("guu cav_E %s0 0 0 {r} th" % zero, "guth 0 {r} th", "cav_E", "cav_E"),
+             2: ("guu 1 %sext_M (ext_a * {r}) ext_a {r} th" % zero, "guth ext_a {r} th", "1", "ext_M, ext_a")}
+    c, s = sp.Symbol("(cos th)", real=True), sp.Symbol("(sin th)", real=True)
+    guu_out = -(1 - 2 * M / SR + 2 * accel * SR * c) + accel ** 2 * SR ** 2 * s ** 2
+    slopes = {1: ("0", "0"), 2: tuple(rocq_expr(sp.expand(sp.diff(e, SR).subs(SR, 2)))
+                                      for e in (guu_out, -accel * SR ** 2 * s))}
+    # the faces' lemmas differentiate g_uu and g_uth with the jets held as functions whose derivatives are known, and
+    # take the jets' values at the face from one lemma each
+    defined = set(live) | {nm for nm, v in jets.items() if v == 0}
+    roots = [nm for nm in ["E"] + (["e"] if dipole else []) + ["m", "W", "U"] if nm + "_r" in defined]
+    face_jets = [nm + suf for nm in roots for suf in ("", "_r")]
+    L += ["Ltac face_side H := repeat match goal with",
+          "  | |- _ /\\ _ => split", "  | |- True => exact I", "  | |- _ <> 0 => nonzero_at"]
+    L += ["  | |- ex_derive (fun x => j_%s x) _ => eexists; apply (j_%s_derive _ H)" % (nm, nm) for nm in roots]
+    L += ["  end.", ""]
+    for at, name in ((1, "meets_cavity"), (2, "meets_exterior")):
+        g_in, h_in, e_in, names = sides[at]
+        du, dh = slopes[at]
+        vals = [(nm, sp.cancel(jets[nm].subs(SR, at))) for nm in face_jets]
+        vs = ["V%d" % i for i in range(len(vals))]
+        L += ["Lemma jets_at_%d : %s." % (at, " /\\ ".join("j_%s %d = %s" % (nm, at, rocq_expr(v)) for nm, v in vals)),
+              "Proof. unfold %s. repeat split; field. Qed." % unfold(*["j_" + nm for nm in face_jets]), ""]
+        derivs = " ".join("rewrite ?(is_derive_unique (fun x : R => j_%s x) %d _ (j_%s_derive %d Hat));" % (
+            nm, at, nm, at) for nm in roots)
+        L += ["Lemma %s th :" % name,
+              "  %s = %s /\\" % (wall_g[0].format(r=at), g_in.format(r=at)),
+              "  is_derive (fun r => %s) %d (%s) /\\ is_derive (fun r => %s) %d (%s) /\\" % (
+                  wall_g[0].format(r="r"), at, du, g_in.format(r="r"), at, du),
+              "  %s = %s /\\" % (wall_g[1].format(r=at), h_in.format(r=at)),
+              "  is_derive (fun r => %s) %d (%s) /\\ is_derive (fun r => %s) %d (%s) /\\" % (
+                  wall_g[1].format(r="r"), at, dh, h_in.format(r="r"), at, dh),
+              "  j_E %d = %s%s." % (at, e_in, (" /\\ j_e %d = 0" % at) if dipole else ""),
+              "Proof.", "  assert (Hat : 1 <= %d <= 2) by lra." % at,
+              "  destruct jets_at_%d as (%s)." % (at, " & ".join(vs)),
+              "  unfold guu, guth, %s." % names,
+              "  refine (conj _ (conj _ (conj _ (conj _ (conj _ (conj _ %s))))));" % ("(conj _ _)" if dipole else "_"),
+              "    first [ rewrite ?%s; field; nonzero_at" % ", ?".join(vs),
+              "          | auto_derive; [ face_side Hat | %s rewrite ?%s; field; nonzero_at ] ]." % (
+                  derivs, ", ?".join(vs)), "Qed.", ""]
+    cargs = " ".join(inside.get(nm, "0") for nm in live)
+    oargs = " ".join(outside.get(nm, "0") for nm in live)
+    bc = rocket_frame(["G_%s r (cos th) (sin th) %s" % (tag[k], cargs) for k in keys], "1", "1")
+    bo = rocket_frame(["G_%s r (cos th) (sin th) %s" % (tag[k], oargs) for k in keys], "ext_H0 r", "sqrt (ext_H0 r)")
+    L.append("(* the components in the cavity and in the exhaust, whose density on the frame is ex_rho *)")
+    L += ["Definition c%s (r th : R) : R := %s." % (o, bc[o]) for o in ORTHO]
+    L += ["Definition o%s (r th : R) : R := %s." % (o, bo[o]) for o in ORTHO]
+    L += ["Definition ex_rho (r th : R) : R := - 2 * (3 * ext_M * ext_a * cos th + ext_M_u) / (r ^ 2 * ext_H0 r).", ""]
+    gs = ", ".join(["G_" + tag[k] for k in keys] + list(parts))
+    L += ["Lemma cavity_empty r th : 0 < r -> %s." % " /\\ ".join("c%s r th = 0" % o for o in ORTHO),
+          "Proof.", "  intros Hr. unfold %s, %s, cav_E, cav_E_u. repeat split; field; nonzero_at." % (
+              ", ".join("c" + o for o in ORTHO), gs), "Qed.", "",
+          "Lemma exterior_dust r th : 2 <= r -> oE r th = ex_rho r th /\\ oa r th = - (1 * ex_rho r th) /\\ od r th = 0 /\\",
+          "  oS r th = 1 * 1 * ex_rho r th /\\ ox r th = 0 /\\ oT r th = 0 /\\ oP r th = 0.",
+          "Proof.", "  intros Hr. pose proof (ext_H0_positive r Hr) as HH.",
+          "  assert (0 < sqrt (ext_H0 r)) by (apply sqrt_lt_R0; exact HH).",
+          "  unfold %s, ex_rho, %s, ext_M, ext_M_u, ext_a. repeat split; field; nonzero_at." % (
+              ", ".join("o" + o for o in ORTHO), gs), "Qed.", "",
+          "(* the exhaust's density is non-negative, as kappa >= 1 *)",
+          "Lemma exhaust_density r th : 2 <= r -> 0 <= ex_rho r th.",
+          "Proof.", "  intros Hr. pose proof (COS_bound th) as Hc. pose proof (ext_H0_positive r Hr) as HH.",
+          "  unfold ex_rho, ext_M, ext_M_u, ext_a. apply Rdiv_le_0_compat; [lra |].",
+          "  apply Rmult_lt_0_compat; [apply pow_lt; lra | exact HH].", "Qed.", "",
+          "(* every energy condition, for every observer, at every point off the centre *)",
+          "Theorem spacetime_energy_conditions r th : 0 < r -> 0 <= th <= PI ->",
+          "  energy_conditions %s." % " ".join("(region (c%s r th) (t%s r th) (o%s r th) r)" % (o, o, o) for o in ORTHO),
+          "Proof.",
+          "  intros Hr Hth. destruct (Rlt_le_dec r 1) as [H1 | H1].",
+          "  - rewrite !region_inside by exact H1.",
+          "    destruct (cavity_empty r th Hr) as (-> & -> & -> & -> & -> & -> & ->). apply empty_conditions.",
+          "  - destruct (Rle_lt_dec r 2) as [H2 | H2].",
+          "    + rewrite !region_wall by (split; lra). apply shell_energy_conditions; [split; lra | exact Hth].",
+          "    + rewrite !region_outside by exact H2.",
+          "      destruct (exterior_dust r th ltac:(lra)) as (-> & -> & -> & -> & -> & -> & ->).",
+          "      apply dust_conditions; [apply exhaust_density; lra | lra].",
+          "Qed.", ""]
+    return L
+
+
+def join_lines(jets, live, keys, tag, exterior, mass, parts=()):
+    """The lemmas of a drag shell's module on its flat cavity and its exterior: the cavity holds the wall's jets at
+    r = 1 constant, the exterior has the profiles `exterior` and no shift; both are empty, and the wall's jets meet
+    theirs to first order at the faces. `parts` are the definitions G_* are written in."""
+    roots = [nm for nm in live if "_" not in nm]
+    cav = {nm: sp.nsimplify(sp.cancel(jets[nm].subs(SR, 1))) for nm in roots}
+    ext = {nm + suf: sp.cancel(sp.diff(e, SR, k)) for nm, e in exterior.items() for k, suf in enumerate(("", "_r", "_rr"))}
+    L = ["(* inside the wall the flat cavity, drifting with the shift of its face, and outside it Schwarzschild's",
+         "   exterior of mass %s with no shift: both are empty, and the wall's jets meet theirs to first order at both" % mass,
+         "   faces *)"]
+    L += ["Definition cav_%s : R := %s." % (nm, rocq_expr(v)) for nm, v in cav.items()]
+    L += ["Definition ext_%s (r : R) : R := %s." % (nm, rocq_frac(e, integral=True)) for nm, e in ext.items()] + [""]
+    walls = ", ".join("j_%s, j_%s_r" % (nm, nm) for nm in roots)
+    L += ["Lemma meets_cavity : %s." % " /\\ ".join(["j_%s 1 = cav_%s" % (nm, nm) for nm in roots]
+                                                   + ["j_%s_r 1 = 0" % nm for nm in roots]),
+          "Proof. unfold %s, %s. repeat split; field; nonzero_at. Qed." % (walls, ", ".join("cav_" + nm for nm in roots)), "",
+          "Lemma meets_exterior : %s." % " /\\ ".join(
+              "j_%s%s 2 = %s" % (nm, suf, "ext_%s%s 2" % (nm, suf) if nm in exterior else "0")
+              for nm in roots for suf in ("", "_r")),
+          "Proof. unfold %s, %s. repeat split; field; nonzero_at. Qed." % (
+              walls, ", ".join("ext_%s, ext_%s_r" % (nm, nm) for nm in exterior)), ""]
+    for nm in exterior:
+        for a, b in (("", "_r"), ("_r", "_rr")):
+            L += ["Lemma ext_%s%s_derive r : 2 <= r -> is_derive ext_%s%s r (ext_%s%s r)." % (nm, a, nm, a, nm, b),
+                  "Proof.", "  intros Hr. unfold ext_%s%s, ext_%s%s. auto_derive; [ nonzero_at | field; nonzero_at ]."
+                  % (nm, a, nm, b), "Qed.", ""]
+    inside = " ".join("cav_%s" % nm if nm in cav else "0" for nm in live)
+    outside = " ".join("(ext_%s r)" % nm if nm in ext else "0" for nm in live)
+    L.append("(* the components in the cavity and in the exterior *)")
+    L += ["Definition c%s (r th : R) : R := G_%s r (cos th) (sin th) %s." % (o, tag[k], inside) for k, o in zip(keys, ORTHO)]
+    L += ["Definition o%s (r th : R) : R := G_%s r (cos th) (sin th) %s." % (o, tag[k], outside) for k, o in zip(keys, ORTHO)]
+    gs = ", ".join(["G_" + tag[k] for k in keys] + list(parts))
+    zeros = " as (-> & -> & -> & -> & -> & -> & ->). apply empty_conditions."
+    L += ["", "Lemma cavity_empty r th : 0 < r -> %s." % " /\\ ".join("c%s r th = 0" % o for o in ORTHO),
+          "Proof.", "  intros Hr. unfold %s, %s, %s. repeat split; field; nonzero_at." % (
+              ", ".join("c" + o for o in ORTHO), gs, ", ".join("cav_" + nm for nm in cav)), "Qed.", "",
+          "Lemma exterior_empty r th : 2 <= r -> %s." % " /\\ ".join("o%s r th = 0" % o for o in ORTHO),
+          "Proof.", "  intros Hr. unfold %s, %s, %s. repeat split; field; nonzero_at." % (
+              ", ".join("o" + o for o in ORTHO), gs, ", ".join("ext_" + nm for nm in ext)), "Qed.", "",
+          "(* every energy condition, for every observer, at every point off the centre *)",
+          "Theorem spacetime_energy_conditions r th : 0 < r -> 0 <= th <= PI ->",
+          "  energy_conditions %s." % " ".join("(region (c%s r th) (t%s r th) (o%s r th) r)" % (o, o, o) for o in ORTHO),
+          "Proof.",
+          "  intros Hr Hth. destruct (Rlt_le_dec r 1) as [H1 | H1].",
+          "  - rewrite !region_inside by exact H1. destruct (cavity_empty r th Hr)" + zeros,
+          "  - destruct (Rle_lt_dec r 2) as [H2 | H2].",
+          "    + rewrite !region_wall by (split; lra). apply shell_energy_conditions; [split; lra | exact Hth].",
+          "    + rewrite !region_outside by exact H2. destruct (exterior_empty r th ltac:(lra))" + zeros,
+          "Qed.", ""]
+    return L
 
 
 # The closed-form shells nacelle.v certifies, as `nacelle shells certify` takes them: a drag shell's mass and shift
 # amplitude, and a rocket shell's redshift depth, acceleration, exhaust power over the minimum 3 M a, and multipliers
 # mu = k1 8 pi rho and lam = k2 (8 pi rho)^2.
 CLOSED_SHELLS = {"mass": "3/2", "shift": "1/100", "depth": "1/5", "accel": "1/200", "kappa": "5/4", "k1": "3/4", "k2": "1/2"}
+
+
+def drag_exterior(M):
+    """The lapse and conformal factor of Schwarzschild's solution of mass M in isotropic coordinates, which a closed-form
+    drag shell of that mass meets at r = 2."""
+    psi = 1 + M / (2 * SR)
+    return {"N": (2 - psi) / psi, "psi": psi}
 
 
 def closed_shells(mass, shift, depth, accel, kappa, k1, k2):
@@ -7167,25 +8615,50 @@ def closed_shells(mass, shift, depth, accel, kappa, k1, k2):
     half = sp.Rational(1, 2)
     drag = dict(module="Drag", family="drag", jets=drag_closed_jets(M, b),
                 rho=closed_shell("drag", drag_closed_jets(M, sp.Integer(0)), [(0, 0)])[1][(0, 0)], k1=half, k2=half,
+                exterior=drag_exterior(M), mass=M,
                 note="Drag shell on 1 <= r <= 2 with M = %s and shift amplitude %s." % (M, b))
     dl, a, kap = sp.Rational(depth), sp.Rational(accel), sp.Rational(kappa)
-    jets, Mr = rocket_closed_jets(dl, a, kap)
+    jets, Mr, evo = rocket_closed_jets(dl, a, kap, evolution=True)
     rocket = dict(module="Rocket", family="rocket", jets=jets, rho=sp.cancel(2 * jets["m_r"] / SR ** 2),
                   k1=sp.Rational(k1), k2=sp.Rational(k2), H0=sp.cancel(1 - 2 * jets["m"] / SR),
+                  rocket=dict(evolution=evo, accel=a, kappa=kap),
                   note="Rocket shell on 1 <= r <= 2 with E = 1 - %s (2 - r), acceleration %s, exhaust factor %s."
                   % (dl, a, kap))
     shells = {"drag shell M = %s, shift %s" % (M, b): drag,
               "rocket shell depth %s (M = %s), acceleration %s, kappa %s" % (dl, Mr, a, kap): rocket}
-    found = load_store().get("certified", {}).get("drag")
-    if found:
-        q = {k: sp.Rational(found[k]) for k in CertifiableDragProblem.NAMES}
+    for found in certified_drag_shells():
+        q = {k: [sp.Rational(v) for v in found[k]] for k in ("f", "h", "p", "k1", "k2")}
         Mf = sp.Rational(found["M"])
         shells["searched drag shell M = %s, drift %.4f" % (Mf, found["drift"])] = dict(
-            module="Searched", family="drag", jets=drag_closed_jets(Mf, q["b"], (q["f0"], q["f1"]), (q["h0"], q["h1"])),
+            module="Searched_" + ("%g" % float(Mf)).replace(".", "_"), family="drag",
+            jets=drag_closed_jets(Mf, sp.Rational(found["b"]), q["f"], q["h"], q["p"]),
             rho=closed_shell("drag", drag_closed_jets(Mf, sp.Integer(0)), [(0, 0)])[1][(0, 0)], k1=q["k1"], k2=q["k2"],
-            note="Drag shell on 1 <= r <= 2 with M = %s whose shift nacelle shells certifiable found, for a drift of "
-                 "%.4f." % (Mf, found["drift"]))
+            exterior=drag_exterior(Mf), mass=Mf,
+            note="Drag shell on 1 <= r <= 2 with M = %s whose shift and conformal factor nacelle shells certifiable "
+                 "found, for a drift of %.4f." % (Mf, found["drift"]))
+    for found in certified_shells("rocket"):
+        q = {k: [sp.Rational(v) for v in found[k]] for k in ("g", "u", "v", "q", "k1", "k2")}
+        ar, lam, kr = sp.Rational(found["a"]), sp.Rational(found["lam"]), sp.Rational(found["kappa"])
+        jets, Mx, evo, texts = rocket_bern_jets(lam, ar, q["g"], q["u"], q["v"], q["q"], kr, texts=True)
+        shells["searched rocket shell M = %s, a / M = %.4f" % (Mx, found["accel_over_mass"])] = dict(
+            module="Rocket_" + found["target"].replace(".", "_"), family="rocket", jets=jets,
+            rho=sp.cancel(2 * jets["m_r"] / SR ** 2), k1=q["k1"], k2=q["k2"], H0=sp.cancel(1 - 2 * jets["m"] / SR),
+            rocket=dict(evolution=evo, accel=ar, kappa=kr), texts=texts,
+            note="Rocket shell on 1 <= r <= 2 of mass M = %s, about %s, whose profiles nacelle shells certifiable "
+                 "found, for an acceleration of %.4f M / R1^2 at exhaust factor %s." % (
+                     Mx, found["target"], found["accel_over_mass"], kr))
     return shells
+
+
+def certified_shells(family, store=None):
+    """The shells of a family `nacelle shells certifiable` keeps in results/shells.json, by increasing mass."""
+    kept = (store if store is not None else load_store()).get("certified", {}).get(family, {})
+    return sorted(kept.values(), key=lambda found: sp.Rational(found["M"]))
+
+
+def certified_drag_shells(store=None):
+    """The drag shells `nacelle shells certifiable` keeps in results/shells.json, by increasing mass."""
+    return certified_shells("drag", store)
 
 
 FACE_NAMES = {(0, 0): "E", (0, 1): "T0r", (0, 2): "T0th", (1, 1): "Srr", (1, 2): "Srth", (2, 2): "Sthth",
@@ -7205,15 +8678,18 @@ def face_tensor():
 
 
 def face_module():
-    """The Rocq module proving that the dominant condition bounds the cavity drift at a C^1-matched inner face."""
+    """The Rocq module proving that the dominant condition bounds the cavity drift at a C^1-matched inner face, and
+    that face data at that bound meet every condition."""
     T = closed_forms("drag")
     names = [a for a in DRAG_ARGS if a != "b_t"]
     binder = "(%s : R)" % " ".join(names)
     L = ["(* At the inner face of a drag shell matched C^1 to its flat cavity, the energy density E, the radial",
          "   momentum T0r and the tangential momentum T0th seen by the free-fall observer are rho0, -D cos(th) rho0",
          "   and D sin(th) h_rr / (16 pi psi^4), where D = psi^2 b / N is the cavity drift.  The face theorem: where",
-         "   rho0 > 0, a causal energy flux for that observer requires D^2 cos(th)^2 <= 1. *)", "Module Face.", ""]
-    for key in ((0, 0), (0, 1), (0, 2)):
+         "   rho0 > 0, a causal energy flux for that observer requires D^2 cos(th)^2 <= 1.  The bound is sharp: at",
+         "   D = 1, with h_rr = 0, f_rr = 8 pi psi^4 rho0 and N_rr = 4 pi N psi^4 rho0, the face carries dust that",
+         "   meets every condition. *)", "Module Face.", ""]
+    for key in DRAG_KEYS:
         num, den = sp.fraction(sp.cancel(8 * sp.pi * T[key].subs(sp.Symbol("b_t", real=True), 0)))
         L += ["Definition G_%d%d %s : R :=\n  %s / %s." % (key[0], key[1], binder, rocq_expr(sp.expand(num)),
                                                           rocq_expr(sp.factor(den))), ""]
@@ -7226,16 +8702,34 @@ def face_module():
           "Ltac nz := repeat split; try apply PI_neq0; try lra; try (apply pow_nonzero; lra);",
           "           try (apply Rgt_not_eq; apply pow_lt; lra).", ""]
     face = face_tensor()
-    rhs = {(0, 0): "rho0", (0, 1): "- (D * c * rho0)", (0, 2): "D * s * Hrr / (16 * PI * psi^4)"}
-    for key in ((0, 0), (0, 1), (0, 2)):
-        want = {(0, 0): sp.Symbol("rho0", real=True),
-                (0, 1): -sp.Symbol("D", real=True) * sp.Symbol("c", real=True) * sp.Symbol("rho0", real=True),
-                (0, 2): sp.Symbol("D", real=True) * sp.Symbol("s", real=True) * sp.Symbol("h_rr", real=True)
-                / (16 * sp.pi * sp.Symbol("psi", real=True) ** 4)}[key]
-        if sp.simplify(face[key] - want) != 0:
+    D, c, s, rho0, psi, N, Nrr, Frr, Hrr = (sp.Symbol(n, real=True) for n in "D c s rho0 psi N N_rr f_rr h_rr".split())
+    side = (Nrr / (8 * sp.pi * N * psi ** 4) - rho0 / 2 + D ** 2 * c ** 2 * (rho0 - Frr / (8 * sp.pi * psi ** 4)),
+            "Nrr / (8 * PI * N * psi^4) - rho0 / 2 + D^2 * c^2 * (rho0 - Frr / (8 * PI * psi^4))")
+    want = {(0, 0): (rho0, "rho0"), (0, 1): (-D * c * rho0, "- (D * c * rho0)"),
+            (0, 2): (D * s * Hrr / (16 * sp.pi * psi ** 4), "D * s * Hrr / (16 * PI * psi^4)"),
+            (1, 1): (D ** 2 * c ** 2 * rho0, "D^2 * c^2 * rho0"),
+            (1, 2): (-D ** 2 * c * s * Hrr / (16 * sp.pi * psi ** 4), "- (D^2 * c * s * Hrr / (16 * PI * psi^4))"),
+            (2, 2): side, (3, 3): side}
+    for key in DRAG_KEYS:
+        if sp.simplify(face[key] - want[key][0]) != 0:
             raise ValueError("face component %s is %s" % (key, face[key]))
-        L += ["Lemma face_%d%d : jets G_%d%d = 8 * PI * (%s)." % (key[0], key[1], key[0], key[1], rhs[key]),
+        L += ["Lemma face_%d%d : jets G_%d%d = 8 * PI * (%s)." % (key[0], key[1], key[0], key[1], want[key][1]),
               "Proof.", "  unfold jets, G_%d%d. field. nz." % key, "Qed.", ""]
+    each = " /\\\n  ".join("jets G_%d%d / (8 * PI) = %s" % (key + (value,)) for key, value in zip(
+        DRAG_KEYS, ("rho0", "- (c * rho0)", "0", "c * c * rho0", "0", "0", "0")))
+    ratios = " ".join("(jets G_%d%d / (8 * PI))" % key for key in DRAG_KEYS)
+    sharp = ["(* at the light speed the face data above carry dust of density rho0 moving with (1, -cos th) on the frame *)",
+             "Lemma face_dust : D = 1 -> Hrr = 0 -> Frr = 8 * PI * psi^4 * rho0 -> Nrr = 4 * PI * N * psi^4 * rho0 ->",
+             "  %s." % each, "Proof.", "  intros E1 E2 E3 E4.",
+             "  rewrite %s, E1, E2, E3, E4." % ", ".join("face_%d%d" % key for key in DRAG_KEYS),
+             "  repeat split; field; nz.", "Qed.", "",
+             "(* the face theorem's bound is sharp: face data drifting at the light speed meet every condition *)",
+             "Theorem face_sharp :",
+             "  0 <= rho0 -> -1 <= c <= 1 -> D = 1 -> Hrr = 0 -> Frr = 8 * PI * psi^4 * rho0 ->",
+             "  Nrr = 4 * PI * N * psi^4 * rho0 -> energy_conditions %s." % ratios, "Proof.",
+             "  intros Hrho Hc E1 E2 E3 E4.",
+             "  destruct (face_dust E1 E2 E3 E4) as (-> & -> & -> & -> & -> & -> & ->).",
+             "  apply dust_conditions; assumption.", "Qed.", ""]
     L += ["(* the energy flux the free-fall observer sees is (E, -T0r, -T0th, 0); the dominant condition makes it causal *)",
           "Theorem face_drift :",
           "  0 < rho0 ->",
@@ -7253,7 +8747,1002 @@ def face_module():
           "  assert (0 < rho0^2) by (apply pow_lt; lra).",
           "  replace ((D * c * rho0)^2) with ((D^2 * c^2) * rho0^2) in Hb by ring.",
           "  nra.",
-          "Qed.", "", "End At.", "End Face.", ""]
+          "Qed.", ""] + sharp + ["End At.", "End Face.", ""]
+    return L
+
+
+# The Einstein tensor from a metric's components and their derivatives by the curvature formulas, and the same
+# computed on Laurent polynomials by reflection, which proves it equal to a family's G_* on its frame.
+LP_LEMMAS = r"""From Stdlib Require Import QArith Qreals.
+Local Open Scope R_scope.
+
+(* The Einstein tensor at a point from the metric's components g, its inverse gi and their first and second
+   derivatives dg a b k = d_k g_ab and ddg a b k l = d_l d_k g_ab: the Christoffel symbols and their derivatives, the
+   Ricci tensor, its trace and the contraction of G with two vectors. *)
+Definition sum4 (f : nat -> R) : R := f 0%nat + f 1%nat + f 2%nat + f 3%nat.
+
+Section Curvature.
+Variables (g gi : nat -> nat -> R) (dg : nat -> nat -> nat -> R) (ddg : nat -> nat -> nat -> nat -> R).
+Definition dgi a b k := - sum4 (fun p => sum4 (fun q => gi a p * dg p q k * gi q b)).
+Definition Gam l m k := sum4 (fun q => gi l q * (dg q m k + dg q k m - dg m k q)) / 2.
+Definition dGam l m k n := sum4 (fun q => dgi l q n * (dg q m k + dg q k m - dg m k q)
+  + gi l q * (ddg q m k n + ddg q k m n - ddg m k q n)) / 2.
+Definition Ric m k := sum4 (fun l => dGam l m k l - dGam l m l k
+  + sum4 (fun q => Gam l l q * Gam q m k - Gam l k q * Gam q m l)).
+Definition Rs := sum4 (fun m => sum4 (fun k => gi m k * Ric m k)).
+Definition Ein m k := Ric m k - g m k * Rs / 2.
+Definition along (va vb : nat -> R) := sum4 (fun m => sum4 (fun k => Ein m k * va m * vb k)).
+End Curvature.
+
+(* Laurent polynomials: each monomial has integer exponents for the atoms, variables held nonzero, and natural ones
+   for the other variables, a missing exponent being zero, and the coefficients are rationals; lev evaluates one *)
+Definition mono : Type := (list Z * list nat)%type.
+Definition lp : Type := list (mono * Q).
+
+Fixpoint zadd (a b : list Z) : list Z :=
+  match a, b with
+  | x :: a', y :: b' => (x + y)%Z :: zadd a' b'
+  | nil, _ => b
+  | _, nil => a
+  end.
+
+Fixpoint nadd (a b : list nat) : list nat :=
+  match a, b with
+  | x :: a', y :: b' => (x + y)%nat :: nadd a' b'
+  | nil, _ => b
+  | _, nil => a
+  end.
+
+Definition mmul (m1 m2 : mono) : mono := (zadd (fst m1) (fst m2), nadd (snd m1) (snd m2)).
+
+Fixpoint zlo (b : list Z) : comparison :=
+  match b with nil => Eq | y :: b' => match Z.compare 0 y with Eq => zlo b' | c => c end end.
+Fixpoint zhi (a : list Z) : comparison :=
+  match a with nil => Eq | x :: a' => match Z.compare x 0 with Eq => zhi a' | c => c end end.
+Fixpoint zcmp (a b : list Z) : comparison :=
+  match a, b with
+  | nil, _ => zlo b
+  | _, nil => zhi a
+  | x :: a', y :: b' => match Z.compare x y with Eq => zcmp a' b' | c => c end
+  end.
+
+Fixpoint nlo (b : list nat) : comparison :=
+  match b with nil => Eq | y :: b' => match Nat.compare 0 y with Eq => nlo b' | c => c end end.
+Fixpoint nhi (a : list nat) : comparison :=
+  match a with nil => Eq | x :: a' => match Nat.compare x 0 with Eq => nhi a' | c => c end end.
+Fixpoint ncmp (a b : list nat) : comparison :=
+  match a, b with
+  | nil, _ => nlo b
+  | _, nil => nhi a
+  | x :: a', y :: b' => match Nat.compare x y with Eq => ncmp a' b' | c => c end
+  end.
+Definition mcmp (m1 m2 : mono) : comparison :=
+  match zcmp (fst m1) (fst m2) with Eq => ncmp (snd m1) (snd m2) | c => c end.
+
+Fixpoint zev (xs : list R) (es : list Z) : R :=
+  match xs, es with
+  | x :: xs', e :: es' => powerRZ x e * zev xs' es'
+  | _, _ => 1
+  end.
+
+Fixpoint nev (xs : list R) (es : list nat) : R :=
+  match xs, es with
+  | x :: xs', e :: es' => x ^ e * nev xs' es'
+  | _, _ => 1
+  end.
+
+Definition mev (A O : list R) (m : mono) : R := zev A (fst m) * nev O (snd m).
+
+Lemma zlo_ev b : zlo b = Eq -> forall A, zev A b = 1.
+Proof.
+  induction b as [| y b IH]; intros H A; [destruct A; reflexivity |]. cbn [zlo] in H.
+  destruct (Z.compare 0 y) eqn:E; try discriminate. apply Z.compare_eq in E. subst y.
+  destruct A as [| u A]; [reflexivity |]. simpl. rewrite (IH H A). ring.
+Qed.
+
+Lemma zhi_ev a : zhi a = Eq -> forall A, zev A a = 1.
+Proof.
+  induction a as [| x a IH]; intros H A; [destruct A; reflexivity |]. cbn [zhi] in H.
+  destruct (Z.compare x 0) eqn:E; try discriminate. apply Z.compare_eq in E. subst x.
+  destruct A as [| u A]; [reflexivity |]. simpl. rewrite (IH H A). ring.
+Qed.
+
+Lemma zcmp_ev a b : zcmp a b = Eq -> forall A, zev A a = zev A b.
+Proof.
+  revert b. induction a as [| x a IH]; intros b H A.
+  - cbn [zcmp] in H. rewrite (zlo_ev b H A). destruct A; reflexivity.
+  - destruct b as [| y b].
+    + change (zhi (x :: a) = Eq) in H. rewrite (zhi_ev _ H A). destruct A; reflexivity.
+    + cbn [zcmp] in H. destruct (Z.compare x y) eqn:E; try discriminate. apply Z.compare_eq in E. subst y.
+      destruct A as [| u A]; [reflexivity |]. simpl. rewrite (IH b H A). reflexivity.
+Qed.
+
+Lemma nlo_ev b : nlo b = Eq -> forall O, nev O b = 1.
+Proof.
+  induction b as [| y b IH]; intros H O; [destruct O; reflexivity |]. cbn [nlo] in H.
+  destruct (Nat.compare 0 y) eqn:E; try discriminate. apply Nat.compare_eq in E. subst y.
+  destruct O as [| u O]; [reflexivity |]. simpl. rewrite (IH H O). ring.
+Qed.
+
+Lemma nhi_ev a : nhi a = Eq -> forall O, nev O a = 1.
+Proof.
+  induction a as [| x a IH]; intros H O; [destruct O; reflexivity |]. cbn [nhi] in H.
+  destruct (Nat.compare x 0) eqn:E; try discriminate. apply Nat.compare_eq in E. subst x.
+  destruct O as [| u O]; [reflexivity |]. simpl. rewrite (IH H O). ring.
+Qed.
+
+Lemma ncmp_ev a b : ncmp a b = Eq -> forall O, nev O a = nev O b.
+Proof.
+  revert b. induction a as [| x a IH]; intros b H O.
+  - cbn [ncmp] in H. rewrite (nlo_ev b H O). destruct O; reflexivity.
+  - destruct b as [| y b].
+    + change (nhi (x :: a) = Eq) in H. rewrite (nhi_ev _ H O). destruct O; reflexivity.
+    + cbn [ncmp] in H. destruct (Nat.compare x y) eqn:E; try discriminate. apply Nat.compare_eq in E. subst y.
+      destruct O as [| u O]; [reflexivity |]. simpl. rewrite (IH b H O). reflexivity.
+Qed.
+
+Lemma mcmp_ev m1 m2 : mcmp m1 m2 = Eq -> forall A O, mev A O m1 = mev A O m2.
+Proof.
+  destruct m1 as [a1 n1], m2 as [a2 n2]. unfold mcmp, mev; simpl.
+  destruct (zcmp a1 a2) eqn:E; try discriminate. intros H A O. rewrite (zcmp_ev _ _ E A), (ncmp_ev _ _ H O). reflexivity.
+Qed.
+
+Fixpoint lev (A O : list R) (p : lp) : R :=
+  match p with
+  | nil => 0
+  | (m, c) :: p' => Q2R c * mev A O m + lev A O p'
+  end.
+
+Lemma zev_add A a b : List.Forall (fun x => x <> 0) A -> zev A (zadd a b) = zev A a * zev A b.
+Proof.
+  intros HA. revert a b. induction HA as [| x A Hx HA IH]; intros a b; [simpl; destruct (zadd a b), a, b; simpl; ring |].
+  destruct a as [| e1 a], b as [| e2 b]; simpl; try ring.
+  rewrite powerRZ_add by exact Hx. rewrite IH. ring.
+Qed.
+
+Lemma nev_add O a b : nev O (nadd a b) = nev O a * nev O b.
+Proof.
+  revert a b. induction O as [| x O IH]; intros a b; [simpl; destruct (nadd a b), a, b; simpl; ring |].
+  destruct a as [| e1 a], b as [| e2 b]; simpl; try ring.
+  rewrite pow_add, IH. ring.
+Qed.
+
+Lemma mev_mul A O m1 m2 : List.Forall (fun x => x <> 0) A -> mev A O (mmul m1 m2) = mev A O m1 * mev A O m2.
+Proof. intros HA. unfold mev, mmul; simpl. rewrite zev_add by exact HA. rewrite nev_add. ring. Qed.
+
+Lemma Q2R_red q : Q2R (Qred q) = Q2R q.
+Proof. apply Qeq_eqR, Qred_correct. Qed.
+
+(* the sum, merging monomials kept in order and dropping those that cancel *)
+Fixpoint lp_add (p : lp) : lp -> lp :=
+  match p with
+  | nil => fun q => q
+  | (m1, c1) :: p' =>
+      fix add_aux (q : lp) : lp :=
+        match q with
+        | nil => p
+        | (m2, c2) :: q' =>
+            match mcmp m1 m2 with
+            | Lt => (m1, c1) :: lp_add p' q
+            | Gt => (m2, c2) :: add_aux q'
+            | Eq => let c := Qred (c1 + c2) in if Qeq_bool c 0 then lp_add p' q' else (m1, c) :: lp_add p' q'
+            end
+        end
+  end.
+
+Lemma lev_add A O p q : lev A O (lp_add p q) = lev A O p + lev A O q.
+Proof.
+  revert q. induction p as [| [m1 c1] p IH]; intros q; [simpl; ring |].
+  induction q as [| [m2 c2] q IHq]; [simpl; ring |].
+  destruct (mcmp m1 m2) eqn:E.
+  - assert (Hs : lp_add ((m1, c1) :: p) ((m2, c2) :: q) =
+                 if Qeq_bool (Qred (c1 + c2)) 0 then lp_add p q else (m1, Qred (c1 + c2)) :: lp_add p q)
+      by (simpl; rewrite E; reflexivity).
+    rewrite Hs. pose proof (mcmp_ev _ _ E A O) as Em. destruct (Qeq_bool (Qred (c1 + c2)) 0) eqn:Z0.
+    + assert (Hz : Q2R c1 + Q2R c2 = 0).
+      { apply Qeq_bool_eq in Z0. rewrite <- Q2R_plus, <- Q2R_red, (Qeq_eqR _ _ Z0). unfold Q2R; simpl; field. }
+      rewrite IH. cbn [lev]. rewrite <- Em. replace (Q2R c2) with (- Q2R c1) by lra. ring.
+    + cbn [lev]. rewrite IH, Q2R_red, Q2R_plus, <- Em. ring.
+  - assert (Hs : lp_add ((m1, c1) :: p) ((m2, c2) :: q) = (m1, c1) :: lp_add p ((m2, c2) :: q))
+      by (simpl; rewrite E; reflexivity).
+    rewrite Hs. cbn [lev]. rewrite IH. cbn [lev]. ring.
+  - assert (Hs : lp_add ((m1, c1) :: p) ((m2, c2) :: q) = (m2, c2) :: lp_add ((m1, c1) :: p) q)
+      by (simpl; rewrite E; reflexivity).
+    rewrite Hs. cbn [lev]. rewrite IHq. cbn [lev]. ring.
+Qed.
+
+Definition lp_tmul (t : mono * Q) (p : lp) : lp :=
+  if Qeq_bool (snd t) 0 then nil else map (fun mc => (mmul (fst t) (fst mc), Qred (snd t * snd mc))) p.
+
+Lemma lev_tmul A O t p : List.Forall (fun x => x <> 0) A ->
+  lev A O (lp_tmul t p) = Q2R (snd t) * mev A O (fst t) * lev A O p.
+Proof.
+  intros HA. unfold lp_tmul. destruct (Qeq_bool (snd t) 0) eqn:Z0.
+  { apply Qeq_bool_eq, Qeq_eqR in Z0. rewrite Z0. unfold Q2R; simpl. ring. }
+  induction p as [| [m c] p IH]; cbn [lev map fst snd]; [ring |].
+  rewrite IH, Q2R_red, Q2R_mult, mev_mul by exact HA. ring.
+Qed.
+
+Fixpoint lp_mul (p q : lp) : lp :=
+  match p with nil => nil | t :: p' => lp_add (lp_tmul t q) (lp_mul p' q) end.
+
+Lemma lev_mul A O p q : List.Forall (fun x => x <> 0) A -> lev A O (lp_mul p q) = lev A O p * lev A O q.
+Proof.
+  intros HA. induction p as [| [m c] p IH]; cbn [lp_mul lev]; [ring |].
+  rewrite lev_add, lev_tmul by exact HA. rewrite IH. cbn [fst snd]. ring.
+Qed.
+
+Definition lp_neg (p : lp) : lp := map (fun mc => (fst mc, Qopp (snd mc))) p.
+
+Lemma lev_neg A O p : lev A O (lp_neg p) = - lev A O p.
+Proof. unfold lp_neg. induction p as [| [m c] p IH]; cbn [lev map fst snd]; [ring |]. rewrite IH, Q2R_opp. ring. Qed.
+
+Definition lp_half (p : lp) : lp := map (fun mc => (fst mc, Qred (snd mc * (1 # 2)))) p.
+
+Lemma lev_half A O p : lev A O (lp_half p) = lev A O p / 2.
+Proof.
+  unfold lp_half. induction p as [| [m c] p IH]; cbn [lev map fst snd]; [field |].
+  rewrite IH, Q2R_red, Q2R_mult. unfold Q2R at 2. simpl. field.
+Qed.
+
+Definition lp_zero (p : lp) : bool := match p with nil => true | _ => false end.
+
+Lemma lp_zero_eq A O p q : lp_zero (lp_add p (lp_neg q)) = true -> lev A O p = lev A O q.
+Proof.
+  intros H. destruct (lp_add p (lp_neg q)) eqn:E; [| discriminate].
+  pose proof (lev_add A O p (lp_neg q)) as L. rewrite E, lev_neg in L. simpl in L. lra.
+Qed.
+
+(* the curvature formulas over Laurent polynomials, each table built once *)
+Definition lsum4 (f : nat -> lp) : lp := lp_add (lp_add (lp_add (f 0%nat) (f 1%nat)) (f 2%nat)) (f 3%nat).
+
+Section LCurvature.
+Variables (g gi : nat -> nat -> lp) (dg : nat -> nat -> nat -> lp) (ddg : nat -> nat -> nat -> nat -> lp).
+Definition ldgi a b k := lp_neg (lsum4 (fun p => lsum4 (fun q => lp_mul (lp_mul (gi a p) (dg p q k)) (gi q b)))).
+Definition lGam l m k :=
+  lp_half (lsum4 (fun q => lp_mul (gi l q) (lp_add (lp_add (dg q m k) (dg q k m)) (lp_neg (dg m k q))))).
+Variable dgiF : nat -> nat -> nat -> lp.
+Definition ldGam l m k n := lp_half (lsum4 (fun q => lp_add
+  (lp_mul (dgiF l q n) (lp_add (lp_add (dg q m k) (dg q k m)) (lp_neg (dg m k q))))
+  (lp_mul (gi l q) (lp_add (lp_add (ddg q m k n) (ddg q k m n)) (lp_neg (ddg m k q n)))))).
+Variables (GamF : nat -> nat -> nat -> lp) (dGamF : nat -> nat -> nat -> nat -> lp).
+Definition lRic m k := lsum4 (fun l => lp_add (lp_add (dGamF l m k l) (lp_neg (dGamF l m l k)))
+  (lsum4 (fun q => lp_add (lp_mul (GamF l l q) (GamF q m k)) (lp_neg (lp_mul (GamF l k q) (GamF q m l)))))).
+Variable RicF : nat -> nat -> lp.
+Definition lRs := lsum4 (fun m => lsum4 (fun k => lp_mul (gi m k) (RicF m k))).
+Variable RsV : lp.
+Definition lEin m k := lp_add (RicF m k) (lp_neg (lp_half (lp_mul (g m k) RsV))).
+Variable EinF : nat -> nat -> lp.
+Definition lalong (va vb : nat -> lp) := lsum4 (fun m => lsum4 (fun k => lp_mul (lp_mul (EinF m k) (va m)) (vb k))).
+End LCurvature.
+
+Definition tab2 (f : nat -> nat -> lp) := map (fun a => map (fun b => f a b) (seq 0 4)) (seq 0 4).
+Definition tab3 (f : nat -> nat -> nat -> lp) := map (fun a => tab2 (f a)) (seq 0 4).
+Definition tab4 (f : nat -> nat -> nat -> nat -> lp) := map (fun a => tab3 (f a)) (seq 0 4).
+Definition get2 (t : list (list lp)) a b := nth b (nth a t nil) nil.
+Definition get3 (t : list (list (list lp))) a b k := get2 (nth a t nil) b k.
+Definition get4 (t : list (list (list (list lp)))) a b k l := get3 (nth a t nil) b k l.
+
+Lemma nth_seq4 {T : Type} (f : nat -> T) d a : (a < 4)%nat -> nth a (map f (seq 0 4)) d = f a.
+Proof. intros H. do 4 (destruct a as [| a]; [reflexivity |]). lia. Qed.
+
+Lemma get2_tab2 f a b : (a < 4)%nat -> (b < 4)%nat -> get2 (tab2 f) a b = f a b.
+Proof. intros Ha Hb. unfold get2, tab2. rewrite nth_seq4 by exact Ha. apply nth_seq4, Hb. Qed.
+
+Lemma get3_tab3 f a b k : (a < 4)%nat -> (b < 4)%nat -> (k < 4)%nat -> get3 (tab3 f) a b k = f a b k.
+Proof. intros Ha Hb Hk. unfold get3, tab3. rewrite nth_seq4 by exact Ha. apply get2_tab2; assumption. Qed.
+
+Lemma get4_tab4 f a b k l : (a < 4)%nat -> (b < 4)%nat -> (k < 4)%nat -> (l < 4)%nat ->
+  get4 (tab4 f) a b k l = f a b k l.
+Proof. intros Ha Hb Hk Hl. unfold get4, tab4. rewrite nth_seq4 by exact Ha. apply get3_tab3; assumption. Qed.
+
+(* formal derivatives along a coordinate, each variable's derivative a Laurent polynomial *)
+Fixpoint zdec (i : nat) (es : list Z) : list Z :=
+  match es, i with
+  | e :: es', O => (e - 1)%Z :: es'
+  | e :: es', S i' => e :: zdec i' es'
+  | nil, _ => nil
+  end.
+
+Fixpoint ndec (i : nat) (es : list nat) : list nat :=
+  match es, i with
+  | e :: es', O => (e - 1)%nat :: es'
+  | e :: es', S i' => e :: ndec i' es'
+  | nil, _ => nil
+  end.
+
+Definition dmono (rA rO : list lp) (m : mono) : lp :=
+  fold_right lp_add nil
+    (map (fun i => lp_tmul ((zdec i (fst m), snd m), inject_Z (nth i (fst m) 0%Z)) (nth i rA nil)) (seq 0 (length (fst m)))
+     ++ map (fun j => lp_tmul ((fst m, ndec j (snd m)), inject_Z (Z.of_nat (nth j (snd m) 0%nat))) (nth j rO nil))
+            (seq 0 (length (snd m)))).
+
+Definition lp_deriv (rA rO : list lp) (p : lp) : lp :=
+  fold_right (fun mc acc => lp_add (lp_tmul ((nil, nil), snd mc) (dmono rA rO (fst mc))) acc) nil p.
+
+Definition lp_eqb (p q : lp) : bool := lp_zero (lp_add p (lp_neg q)).
+
+(* the check: gi is the inverse of g, and on each pair of frame vectors the Einstein tensor of g, whose derivatives
+   are taken along the four coordinates by the rules, is the given target, as same compares them *)
+Definition curv_check {T : Type} (same : lp -> T -> bool) (g gi : nat -> nat -> lp) (rules : nat -> list lp * list lp)
+    (frames : list ((nat -> lp) * (nat -> lp) * T)) : bool :=
+  let dgT := tab3 (fun a b k => lp_deriv (fst (rules k)) (snd (rules k)) (g a b)) in
+  let ddgT := tab4 (fun a b k l => lp_deriv (fst (rules l)) (snd (rules l)) (get3 dgT a b k)) in
+  let dg := get3 dgT in
+  let ddg := get4 ddgT in
+  let dgiT := tab3 (ldgi gi dg) in
+  let GamT := tab3 (lGam gi dg) in
+  let dGamT := tab4 (ldGam gi dg ddg (get3 dgiT)) in
+  let RicT := tab2 (lRic (get3 GamT) (get4 dGamT)) in
+  let RsV := lRs gi (get2 RicT) in
+  let EinT := tab2 (lEin g (get2 RicT) RsV) in
+  forallb (fun a => forallb (fun b => lp_eqb (lsum4 (fun k => lp_mul (g a k) (gi k b)))
+                                              (if Nat.eqb a b then ((nil, nil), 1%Q) :: nil else nil)) (seq 0 4)) (seq 0 4)
+  && forallb (fun f => match f with (va, vb, t) => same (lalong (get2 EinT) va vb) t end) frames.
+
+(* the check's tables evaluate to the curvature of the evaluated metric *)
+Section Transfer.
+Variables (A O : list R).
+Hypothesis HA : List.Forall (fun x => x <> 0) A.
+Let ev2 (f : nat -> nat -> lp) a b := lev A O (f a b).
+Let ev3 (f : nat -> nat -> nat -> lp) a b k := lev A O (f a b k).
+Let ev4 (f : nat -> nat -> nat -> nat -> lp) a b k l := lev A O (f a b k l).
+
+Ltac ev := unfold lsum4, sum4; cbv beta;
+  repeat (rewrite ?lev_half, ?lev_add, ?lev_neg; rewrite ?lev_mul by exact HA).
+
+Lemma ldgi_ev gi dg a b k : lev A O (ldgi gi dg a b k) = dgi (ev2 gi) (ev3 dg) a b k.
+Proof. unfold ldgi, dgi, ev2, ev3. ev. ring. Qed.
+
+Lemma lGam_ev gi dg l m k : lev A O (lGam gi dg l m k) = Gam (ev2 gi) (ev3 dg) l m k.
+Proof. unfold lGam, Gam, ev2, ev3. ev. field. Qed.
+
+Lemma ldGam_ev gi dg ddg dgiF : (forall a b k, (a < 4)%nat -> (b < 4)%nat -> (k < 4)%nat ->
+    lev A O (dgiF a b k) = dgi (ev2 gi) (ev3 dg) a b k) ->
+  forall l m k n, (l < 4)%nat -> (n < 4)%nat ->
+  lev A O (ldGam gi dg ddg dgiF l m k n) = dGam (ev2 gi) (ev3 dg) (ev4 ddg) l m k n.
+Proof.
+  intros H l m k n Hl Hn. unfold ldGam, dGam, ev2, ev3, ev4. ev.
+  rewrite !H by lia. unfold ev2, ev3. field.
+Qed.
+
+Lemma lRic_ev gi dg ddg GamF dGamF :
+  (forall l m k, (l < 4)%nat -> (m < 4)%nat -> (k < 4)%nat -> lev A O (GamF l m k) = Gam (ev2 gi) (ev3 dg) l m k) ->
+  (forall l m k n, (l < 4)%nat -> (m < 4)%nat -> (k < 4)%nat -> (n < 4)%nat ->
+     lev A O (dGamF l m k n) = dGam (ev2 gi) (ev3 dg) (ev4 ddg) l m k n) ->
+  forall m k, (m < 4)%nat -> (k < 4)%nat -> lev A O (lRic GamF dGamF m k) = Ric (ev2 gi) (ev3 dg) (ev4 ddg) m k.
+Proof.
+  intros HG HdG m k Hm Hk. unfold lRic, Ric. ev. rewrite !HdG by lia. rewrite !HG by lia. ring.
+Qed.
+
+Lemma lRs_ev gi dg ddg RicF : (forall m k, (m < 4)%nat -> (k < 4)%nat ->
+    lev A O (RicF m k) = Ric (ev2 gi) (ev3 dg) (ev4 ddg) m k) ->
+  lev A O (lRs gi RicF) = Rs (ev2 gi) (ev3 dg) (ev4 ddg).
+Proof. intros HR. unfold lRs, Rs. ev. rewrite !HR by lia. unfold ev2. ring. Qed.
+
+Lemma lEin_ev g gi dg ddg RicF RsV : (forall m k, (m < 4)%nat -> (k < 4)%nat ->
+    lev A O (RicF m k) = Ric (ev2 gi) (ev3 dg) (ev4 ddg) m k) ->
+  lev A O RsV = Rs (ev2 gi) (ev3 dg) (ev4 ddg) ->
+  forall m k, (m < 4)%nat -> (k < 4)%nat -> lev A O (lEin g RicF RsV m k) = Ein (ev2 g) (ev2 gi) (ev3 dg) (ev4 ddg) m k.
+Proof.
+  intros HR HS m k Hm Hk. unfold lEin, Ein. rewrite lev_add, lev_neg, lev_half, lev_mul by exact HA.
+  rewrite HR, HS by lia. unfold ev2. field.
+Qed.
+
+Lemma lalong_ev g gi dg ddg EinF va vb : (forall m k, (m < 4)%nat -> (k < 4)%nat ->
+    lev A O (EinF m k) = Ein (ev2 g) (ev2 gi) (ev3 dg) (ev4 ddg) m k) ->
+  lev A O (lalong EinF va vb) = along (ev2 g) (ev2 gi) (ev3 dg) (ev4 ddg) (fun a => lev A O (va a)) (fun b => lev A O (vb b)).
+Proof. intros HE. unfold lalong, along. ev. rewrite !HE by lia. ring. Qed.
+End Transfer.
+
+(* the curvature at indices 0 to 3 depends on its arguments there alone *)
+Section Ext.
+Variables (g g' gi gi' : nat -> nat -> R) (dg dg' : nat -> nat -> nat -> R) (ddg ddg' : nat -> nat -> nat -> nat -> R).
+Hypotheses (Hg : forall a b, (a < 4)%nat -> (b < 4)%nat -> g a b = g' a b)
+  (Hgi : forall a b, (a < 4)%nat -> (b < 4)%nat -> gi a b = gi' a b)
+  (Hdg : forall a b k, (a < 4)%nat -> (b < 4)%nat -> (k < 4)%nat -> dg a b k = dg' a b k)
+  (Hddg : forall a b k l, (a < 4)%nat -> (b < 4)%nat -> (k < 4)%nat -> (l < 4)%nat -> ddg a b k l = ddg' a b k l).
+
+Lemma dgi_ext a b k : (a < 4)%nat -> (b < 4)%nat -> (k < 4)%nat -> dgi gi dg a b k = dgi gi' dg' a b k.
+Proof. intros. unfold dgi, sum4. rewrite !Hgi, !Hdg by lia. reflexivity. Qed.
+
+Lemma Gam_ext l m k : (l < 4)%nat -> (m < 4)%nat -> (k < 4)%nat -> Gam gi dg l m k = Gam gi' dg' l m k.
+Proof. intros. unfold Gam, sum4. rewrite !Hgi, !Hdg by lia. reflexivity. Qed.
+
+Lemma dGam_ext l m k n : (l < 4)%nat -> (m < 4)%nat -> (k < 4)%nat -> (n < 4)%nat ->
+  dGam gi dg ddg l m k n = dGam gi' dg' ddg' l m k n.
+Proof. intros. unfold dGam, sum4. rewrite !dgi_ext, !Hgi, !Hdg, !Hddg by lia. reflexivity. Qed.
+
+Lemma Ric_ext m k : (m < 4)%nat -> (k < 4)%nat -> Ric gi dg ddg m k = Ric gi' dg' ddg' m k.
+Proof. intros. unfold Ric, sum4. rewrite !dGam_ext, !Gam_ext by lia. reflexivity. Qed.
+
+Lemma Rs_ext : Rs gi dg ddg = Rs gi' dg' ddg'.
+Proof. unfold Rs, sum4. rewrite !Ric_ext, !Hgi by lia. reflexivity. Qed.
+
+Lemma along_ext va va' vb vb' : (forall a, (a < 4)%nat -> va a = va' a) -> (forall b, (b < 4)%nat -> vb b = vb' b) ->
+  along g gi dg ddg va vb = along g' gi' dg' ddg' va' vb'.
+Proof.
+  intros Ha Hb. unfold along, Ein, sum4. rewrite !Ric_ext, !Hg, !Ha, !Hb by lia. rewrite Rs_ext. reflexivity.
+Qed.
+End Ext.
+
+(* the metric's first and second derivatives, by the formal derivatives along each coordinate *)
+Definition jet1 (g : nat -> nat -> lp) (rules : nat -> list lp * list lp) a b k :=
+  lp_deriv (fst (rules k)) (snd (rules k)) (g a b).
+Definition jet2 (g : nat -> nat -> lp) (rules : nat -> list lp * list lp) a b k l :=
+  lp_deriv (fst (rules l)) (snd (rules l)) (jet1 g rules a b k).
+
+Lemma mev_one A O : mev A O (nil, nil) = 1.
+Proof. unfold mev; simpl. destruct A, O; simpl; ring. Qed.
+
+Theorem curv_check_correct {T : Type} (same : lp -> T -> bool) (val : T -> R) A O g gi rules frames :
+  List.Forall (fun x => x <> 0) A -> (forall p t, same p t = true -> lev A O p = val t) ->
+  curv_check same g gi rules frames = true ->
+  (forall a b, (a < 4)%nat -> (b < 4)%nat ->
+     sum4 (fun k => lev A O (g a k) * lev A O (gi k b)) = if Nat.eqb a b then 1 else 0) /\
+  (forall va vb t, In (va, vb, t) frames ->
+     along (fun a b => lev A O (g a b)) (fun a b => lev A O (gi a b)) (fun a b k => lev A O (jet1 g rules a b k))
+       (fun a b k l => lev A O (jet2 g rules a b k l)) (fun a => lev A O (va a)) (fun b => lev A O (vb b)) = val t).
+Proof.
+  intros HA Hsame H. unfold curv_check in H. cbv zeta in H. apply andb_true_iff in H as [Hinv Hfr]. split.
+  - intros a b Ha Hb.
+    assert (Ha' : In a (seq 0 4)) by (apply in_seq; lia). assert (Hb' : In b (seq 0 4)) by (apply in_seq; lia).
+    pose proof (proj1 (forallb_forall _ _) Hinv a Ha') as Hrow.
+    pose proof (proj1 (forallb_forall _ _) Hrow b Hb') as Hab.
+    unfold lp_eqb in Hab. apply (lp_zero_eq A O) in Hab. unfold lsum4 in Hab.
+    rewrite !lev_add, !lev_mul in Hab by exact HA. unfold sum4. rewrite Hab.
+    destruct (Nat.eqb a b); cbn [lev]; [rewrite mev_one; unfold Q2R; simpl; field | reflexivity].
+  - intros va vb t Hin. pose proof (proj1 (forallb_forall _ _) Hfr _ Hin) as Ht. cbv beta iota in Ht.
+    rewrite <- (Hsame _ _ Ht).
+    set (dgT := tab3 (fun a b k => lp_deriv (fst (rules k)) (snd (rules k)) (g a b))).
+    set (ddgT := tab4 (fun a b k l => lp_deriv (fst (rules l)) (snd (rules l)) (get3 dgT a b k))).
+    set (dgiT := tab3 (ldgi gi (get3 dgT))). set (GamT := tab3 (lGam gi (get3 dgT))).
+    set (dGamT := tab4 (ldGam gi (get3 dgT) (get4 ddgT) (get3 dgiT))).
+    set (RicT := tab2 (lRic (get3 GamT) (get4 dGamT))). set (RsV := lRs gi (get2 RicT)).
+    set (EinT := tab2 (lEin g (get2 RicT) RsV)).
+    set (ev2 := fun (f : nat -> nat -> lp) a b => lev A O (f a b)).
+    set (ev3 := fun (f : nat -> nat -> nat -> lp) a b k => lev A O (f a b k)).
+    set (ev4 := fun (f : nat -> nat -> nat -> nat -> lp) a b k l => lev A O (f a b k l)).
+    assert (Hdgi : forall a b k, (a < 4)%nat -> (b < 4)%nat -> (k < 4)%nat ->
+                     lev A O (get3 dgiT a b k) = dgi (ev2 gi) (ev3 (get3 dgT)) a b k)
+      by (intros; unfold dgiT; rewrite get3_tab3 by assumption; apply (ldgi_ev A O HA)).
+    assert (HGam : forall l m k, (l < 4)%nat -> (m < 4)%nat -> (k < 4)%nat ->
+                     lev A O (get3 GamT l m k) = Gam (ev2 gi) (ev3 (get3 dgT)) l m k)
+      by (intros; unfold GamT; rewrite get3_tab3 by assumption; apply (lGam_ev A O HA)).
+    assert (HdGam : forall l m k n, (l < 4)%nat -> (m < 4)%nat -> (k < 4)%nat -> (n < 4)%nat ->
+                      lev A O (get4 dGamT l m k n) = dGam (ev2 gi) (ev3 (get3 dgT)) (ev4 (get4 ddgT)) l m k n)
+      by (intros; unfold dGamT; rewrite get4_tab4 by assumption; apply (ldGam_ev A O HA); assumption).
+    assert (HRic : forall m k, (m < 4)%nat -> (k < 4)%nat ->
+                     lev A O (get2 RicT m k) = Ric (ev2 gi) (ev3 (get3 dgT)) (ev4 (get4 ddgT)) m k)
+      by (intros; unfold RicT; rewrite get2_tab2 by assumption; apply (lRic_ev A O HA); assumption).
+    assert (HRs : lev A O RsV = Rs (ev2 gi) (ev3 (get3 dgT)) (ev4 (get4 ddgT))) by (apply (lRs_ev A O HA); assumption).
+    assert (HEin : forall m k, (m < 4)%nat -> (k < 4)%nat ->
+                     lev A O (get2 EinT m k) = Ein (ev2 g) (ev2 gi) (ev3 (get3 dgT)) (ev4 (get4 ddgT)) m k)
+      by (intros; unfold EinT; rewrite get2_tab2 by assumption; apply (lEin_ev A O HA); assumption).
+    rewrite (lalong_ev A O HA g gi (get3 dgT) (get4 ddgT) (get2 EinT) va vb HEin).
+    apply along_ext; intros; try reflexivity.
+    + unfold ev3, dgT. rewrite get3_tab3 by assumption. reflexivity.
+    + unfold ev4, ddgT. rewrite get4_tab4 by assumption. unfold dgT. rewrite get3_tab3 by assumption. reflexivity.
+Qed.
+
+(* expressions over the atoms and the other variables, the form a definition's body is read in, and their normal form
+   as Laurent polynomials, which exists where every division is by a monomial in the atoms *)
+Inductive rx : Type :=
+| RA (i : nat) | RO (j : nat) | RZ (z : Z) | RAdd (a b : rx) | RSub (a b : rx) | RMul (a b : rx) | RNeg (a : rx)
+| RInv (a : rx) | RDiv (a b : rx) | RPow (a : rx) (n : nat).
+
+Fixpoint rx_eval (A O : list R) (e : rx) : R :=
+  match e with
+  | RA i => nth i A 1
+  | RO j => nth j O 1
+  | RZ z => IZR z
+  | RAdd a b => rx_eval A O a + rx_eval A O b
+  | RSub a b => rx_eval A O a - rx_eval A O b
+  | RMul a b => rx_eval A O a * rx_eval A O b
+  | RNeg a => - rx_eval A O a
+  | RInv a => / rx_eval A O a
+  | RDiv a b => rx_eval A O a / rx_eval A O b
+  | RPow a n => rx_eval A O a ^ n
+  end.
+
+Definition lp_one : lp := ((nil, nil), 1%Q) :: nil.
+
+Fixpoint zunit (i : nat) : list Z := match i with O => 1%Z :: nil | S i' => 0%Z :: zunit i' end.
+Fixpoint nunit (j : nat) : list nat := match j with O => 1%nat :: nil | S j' => 0%nat :: nunit j' end.
+
+Fixpoint lp_pow (p : lp) (n : nat) : lp := match n with O => lp_one | S n' => lp_mul p (lp_pow p n') end.
+
+Definition lp_inv (p : lp) : option lp :=
+  match p with
+  | (m, q) :: nil =>
+      match nhi (snd m) with
+      | Eq => if Qeq_bool q 0 then None else Some (((map Z.opp (fst m), nil), Qinv q) :: nil)
+      | _ => None
+      end
+  | _ => None
+  end.
+
+Definition omap2 (f : lp -> lp -> lp) (x y : option lp) : option lp :=
+  match x, y with Some p, Some q => Some (f p q) | _, _ => None end.
+
+Fixpoint rx_norm (e : rx) : option lp :=
+  match e with
+  | RA i => Some (((zunit i, nil), 1%Q) :: nil)
+  | RO j => Some (((nil, nunit j), 1%Q) :: nil)
+  | RZ z => Some (if Z.eqb z 0 then nil else ((nil, nil), inject_Z z) :: nil)
+  | RAdd a b => omap2 lp_add (rx_norm a) (rx_norm b)
+  | RSub a b => omap2 (fun p q => lp_add p (lp_neg q)) (rx_norm a) (rx_norm b)
+  | RMul a b => omap2 lp_mul (rx_norm a) (rx_norm b)
+  | RNeg a => option_map lp_neg (rx_norm a)
+  | RInv a => match rx_norm a with Some p => lp_inv p | None => None end
+  | RDiv a b => match rx_norm a, rx_norm b with
+                | Some p, Some q => option_map (lp_mul p) (lp_inv q)
+                | _, _ => None
+                end
+  | RPow a n => option_map (fun p => lp_pow p n) (rx_norm a)
+  end.
+
+Lemma zev_nil A : zev A nil = 1.
+Proof. destruct A; reflexivity. Qed.
+
+Lemma nev_nil O : nev O nil = 1.
+Proof. destruct O; reflexivity. Qed.
+
+Lemma zev_unit A i : zev A (zunit i) = nth i A 1.
+Proof.
+  revert A. induction i as [| i IH]; intros [| x A]; cbn [zunit zev nth]; try reflexivity.
+  - rewrite zev_nil. simpl. ring.
+  - rewrite IH. simpl. ring.
+Qed.
+
+Lemma nev_unit O j : nev O (nunit j) = nth j O 1.
+Proof.
+  revert O. induction j as [| j IH]; intros [| x O]; cbn [nunit nev nth]; try reflexivity.
+  - rewrite nev_nil. ring.
+  - rewrite IH. ring.
+Qed.
+
+Lemma lev_one A O : lev A O lp_one = 1.
+Proof. unfold lp_one. cbn [lev]. rewrite mev_one. unfold Q2R; simpl. field. Qed.
+
+Lemma lev_pow A O p n : List.Forall (fun x => x <> 0) A -> lev A O (lp_pow p n) = lev A O p ^ n.
+Proof.
+  intros HA. induction n as [| n IH]; cbn [lp_pow pow]; [apply lev_one |].
+  rewrite lev_mul by exact HA. rewrite IH. reflexivity.
+Qed.
+
+Lemma zev_nonzero A z : List.Forall (fun x => x <> 0) A -> zev A z <> 0.
+Proof.
+  intros HA. revert z. induction HA as [| x A Hx HA IH]; intros z; [cbn [zev]; lra |].
+  destruct z as [| e z]; cbn [zev]; [lra |].
+  apply Rmult_integral_contrapositive_currified; [apply powerRZ_NOR; exact Hx | apply IH].
+Qed.
+
+Lemma zev_opp A z : List.Forall (fun x => x <> 0) A -> zev A (map Z.opp z) = / zev A z.
+Proof.
+  intros HA. revert z. induction HA as [| x A Hx HA IH]; intros z; [cbn [zev]; rewrite Rinv_1; reflexivity |].
+  destruct z as [| e z]; cbn [map zev]; [rewrite Rinv_1; reflexivity |].
+  rewrite IH, powerRZ_neg', Rinv_mult. reflexivity.
+Qed.
+
+Lemma lp_inv_correct A O p p' : List.Forall (fun x => x <> 0) A -> lp_inv p = Some p' ->
+  lev A O p <> 0 /\ lev A O p' = / lev A O p.
+Proof.
+  intros HA H. destruct p as [| [m q] [| t p]]; try discriminate. unfold lp_inv in H.
+  destruct (nhi (snd m)) eqn:Hn; try discriminate.
+  destruct (Qeq_bool q 0) eqn:Hq; [discriminate |]. injection H as <-.
+  assert (Hq' : ~ q == 0) by (intros E; apply Qeq_bool_iff in E; congruence).
+  assert (HQ : Q2R q <> 0) by (intros E; apply Hq'; apply eqR_Qeq; rewrite E; unfold Q2R; simpl; field).
+  destruct m as [z n]. cbn [fst snd] in *. cbn [lev]. unfold mev. cbn [fst snd].
+  rewrite (nhi_ev n Hn O), nev_nil, zev_opp by exact HA. rewrite Q2R_inv by exact Hq'.
+  pose proof (zev_nonzero A z HA). split.
+  - rewrite Rplus_0_r, Rmult_1_r. apply Rmult_integral_contrapositive_currified; assumption.
+  - field. split; assumption.
+Qed.
+
+Lemma rx_norm_correct A O : List.Forall (fun x => x <> 0) A -> forall e p, rx_norm e = Some p -> rx_eval A O e = lev A O p.
+Proof.
+  intros HA e. induction e as [i | j | z | a IHa b IHb | a IHa b IHb | a IHa b IHb | a IHa | a IHa | a IHa b IHb | a IHa n];
+    intros p H; cbn [rx_norm rx_eval] in *.
+  - injection H as <-. cbn [lev]. unfold mev. cbn [fst snd]. rewrite zev_unit, nev_nil. unfold Q2R; simpl. field.
+  - injection H as <-. cbn [lev]. unfold mev. cbn [fst snd]. rewrite nev_unit, zev_nil. unfold Q2R; simpl. field.
+  - injection H as <-. destruct (Z.eqb_spec z 0) as [-> | Hz]; cbn [lev]; [reflexivity |].
+    rewrite mev_one. unfold Q2R, inject_Z; simpl. field.
+  - destruct (rx_norm a) as [pa |] eqn:Ea, (rx_norm b) as [pb |] eqn:Eb; cbn [omap2] in H; try discriminate.
+    injection H as <-. rewrite lev_add, (IHa _ eq_refl), (IHb _ eq_refl). reflexivity.
+  - destruct (rx_norm a) as [pa |] eqn:Ea, (rx_norm b) as [pb |] eqn:Eb; cbn [omap2] in H; try discriminate.
+    injection H as <-. rewrite lev_add, lev_neg, (IHa _ eq_refl), (IHb _ eq_refl). ring.
+  - destruct (rx_norm a) as [pa |] eqn:Ea, (rx_norm b) as [pb |] eqn:Eb; cbn [omap2] in H; try discriminate.
+    injection H as <-. rewrite lev_mul by exact HA. rewrite (IHa _ eq_refl), (IHb _ eq_refl). reflexivity.
+  - destruct (rx_norm a) as [pa |] eqn:Ea; cbn [option_map] in H; try discriminate.
+    injection H as <-. rewrite lev_neg, (IHa _ eq_refl). reflexivity.
+  - destruct (rx_norm a) as [pa |] eqn:Ea; try discriminate.
+    destruct (lp_inv_correct A O _ _ HA H) as [_ Hv]. rewrite Hv, (IHa _ eq_refl). reflexivity.
+  - destruct (rx_norm a) as [pa |] eqn:Ea, (rx_norm b) as [pb |] eqn:Eb; try discriminate.
+    destruct (lp_inv pb) as [pi |] eqn:Ei; cbn [option_map] in H; try discriminate. injection H as <-.
+    destruct (lp_inv_correct A O _ _ HA Ei) as [_ Hv]. rewrite lev_mul by exact HA.
+    rewrite Hv, (IHa _ eq_refl), (IHb _ eq_refl). reflexivity.
+  - destruct (rx_norm a) as [pa |] eqn:Ea; cbn [option_map] in H; try discriminate. injection H as <-.
+    rewrite lev_pow by exact HA. rewrite (IHa _ eq_refl). reflexivity.
+Qed.
+
+(* each power of c, the first of the other variables, cut to 0 or 1 by c^2 = 1 - w, w the atom at wi *)
+Definition one_minus (wi : nat) : lp := lp_add lp_one (((zunit wi, nil), (-1)%Q) :: nil).
+
+Definition red_term (wi : nat) (t : mono * Q) : lp :=
+  match snd (fst t) with
+  | nil => t :: nil
+  | k :: ns => lp_tmul ((fst (fst t), (k mod 2)%nat :: ns), snd t) (lp_pow (one_minus wi) (k / 2))
+  end.
+
+Fixpoint lp_reduce (wi : nat) (p : lp) : lp :=
+  match p with nil => nil | t :: p' => lp_add (red_term wi t) (lp_reduce wi p') end.
+
+Lemma lev_one_minus A O wi : lev A O (one_minus wi) = 1 - nth wi A 1.
+Proof.
+  unfold one_minus. rewrite lev_add, lev_one. cbn [lev]. unfold mev. cbn [fst snd]. rewrite zev_unit, nev_nil.
+  unfold Q2R; simpl. field.
+Qed.
+
+Lemma red_term_correct A O wi m q : List.Forall (fun x => x <> 0) A -> nth 0 O 1 ^ 2 = 1 - nth wi A 1 ->
+  lev A O (red_term wi (m, q)) = Q2R q * mev A O m.
+Proof.
+  intros HA Hc. destruct m as [z [| k ns]]; unfold red_term; cbn [fst snd]; [cbn [lev]; ring |].
+  rewrite lev_tmul by exact HA. rewrite lev_pow by exact HA. rewrite lev_one_minus. cbn [fst snd].
+  unfold mev. cbn [fst snd]. rewrite <- Hc. destruct O as [| c O]; cbn [nev nth]; [rewrite !pow1; ring |].
+  assert (Hk : c ^ k = c ^ (k mod 2) * (c ^ 2) ^ (k / 2)).
+  { rewrite <- pow_mult, <- pow_add. f_equal. pose proof (Nat.div_mod_eq k 2). lia. }
+  rewrite Hk. ring.
+Qed.
+
+Lemma lp_reduce_correct A O wi p : List.Forall (fun x => x <> 0) A -> nth 0 O 1 ^ 2 = 1 - nth wi A 1 ->
+  lev A O (lp_reduce wi p) = lev A O p.
+Proof.
+  intros HA Hc. induction p as [| [m q] p IH]; [reflexivity |].
+  cbn [lp_reduce lev]. rewrite lev_add, red_term_correct, IH by assumption. reflexivity.
+Qed.
+
+(* the check's comparison: a frame's Einstein component is the expression, both reduced by c^2 = 1 - w *)
+Definition same_rx (wi : nat) (p : lp) (e : rx) : bool :=
+  match rx_norm e with Some q => lp_eqb (lp_reduce wi p) (lp_reduce wi q) | None => false end.
+
+Lemma same_rx_correct A O wi : List.Forall (fun x => x <> 0) A -> nth 0 O 1 ^ 2 = 1 - nth wi A 1 ->
+  forall p e, same_rx wi p e = true -> lev A O p = rx_eval A O e.
+Proof.
+  intros HA Hc p e H. unfold same_rx in H. destruct (rx_norm e) as [q |] eqn:E; [| discriminate].
+  rewrite (rx_norm_correct A O HA e q E). unfold lp_eqb in H. apply (lp_zero_eq A O) in H.
+  rewrite !lp_reduce_correct in H by assumption. exact H.
+Qed.
+
+(* two expressions with one normal form are equal *)
+Definition rx_same (e1 e2 : rx) : bool :=
+  match rx_norm e1, rx_norm e2 with Some p, Some q => lp_eqb p q | _, _ => false end.
+
+Lemma rx_same_correct A O e1 e2 : List.Forall (fun x => x <> 0) A -> rx_same e1 e2 = true -> rx_eval A O e1 = rx_eval A O e2.
+Proof.
+  intros HA H. unfold rx_same in H.
+  destruct (rx_norm e1) as [p |] eqn:E1, (rx_norm e2) as [q |] eqn:E2; try discriminate.
+  rewrite (rx_norm_correct A O HA e1 p E1), (rx_norm_correct A O HA e2 q E2).
+  exact (lp_zero_eq A O p q H).
+Qed.
+"""
+
+
+def einstein_family(family):
+    """A family's metric in coordinates (x0, r, c, ph), c = cos th, with w = 1 - c^2 a variable of its own whose
+    derivative in c is -2 c, over the variables of Laurent polynomials: the atoms, held nonzero, and the other
+    variables, c first and then the jets in the order of the family's arguments; each variable's derivatives along the
+    four coordinates, those of the jets of second order zero, as no formula differentiates them; the frame, with e_th
+    over sin th and e_ph times sin th; and the family's components 8 pi T in its jets, the rocket family's without
+    the lapse's dipole."""
+    r, c, w = SR, SC, sp.Symbol("w", real=True)
+    rocket = family == "rocket"
+    funcs = ("E", "m", "W", "U") if rocket else ("N", "psi", "f", "h")
+    sufs = ("", "_r", "_u", "_rr", "_ru", "_uu") if rocket else ("", "_r", "_rr")
+    jet = {nm + suf: sp.Symbol(nm + suf, real=True) for nm in funcs for suf in sufs}
+    rules = {r: (0, 1, 0, 0), c: (0, 0, 1, 0), w: (0, 0, -2 * c, 0)}
+    for nm in funcs:
+        if rocket:
+            rules[jet[nm]] = (jet[nm + "_u"], jet[nm + "_r"], 0, 0)
+            rules[jet[nm + "_r"]] = (jet[nm + "_ru"], jet[nm + "_rr"], 0, 0)
+            rules[jet[nm + "_u"]] = (jet[nm + "_uu"], jet[nm + "_ru"], 0, 0)
+        else:
+            rules[jet[nm]] = (0, jet[nm + "_r"], 0, 0)
+            rules[jet[nm + "_r"]] = (0, jet[nm + "_rr"], 0, 0)
+    g = sp.zeros(4, 4)
+    if rocket:
+        # -E^2 H du^2 - 2 E du dr + r^2 (dc / w + U du)^2 w + r^2 w dph^2 with H = 1 - 2 m / r + 2 W c
+        E, m, W, U = (jet[nm] for nm in funcs)
+        H = 1 - 2 * m / r + 2 * W * c
+        g[0, 0] = -E ** 2 * H + U ** 2 * r ** 2 * w
+        g[0, 1] = g[1, 0] = -E
+        g[0, 2] = g[2, 0] = U * r ** 2
+        g[2, 2], g[3, 3] = r ** 2 / w, r ** 2 * w
+        frame = {"k": [0, 1, 0, 0], "l": [1 / E, -H / 2, -U * w / E, 0], "2": [0, 0, -1 / r, 0], "3": [0, 0, 0, 1 / r]}
+        names = {"k": "fk", "l": "fl", "2": "f2", "3": "f3"}
+        atoms, keys, tag = [r, E, w], ROCKET_KEYS, {k: k for k in ROCKET_KEYS}
+        args = [a for a in ROCKET_ARGS if a not in ("r", "c", "s") and a[0] != "e"]
+        zero = {sp.Symbol(a, real=True): 0 for a in ROCKET_ARGS if a[0] == "e"}
+    else:
+        # -N^2 dt^2 + psi^4 ((dr + f c dt)^2 + r^2 (dc + h w / r dt)^2 / w + r^2 w dph^2)
+        N, psi, f, h = (jet[nm] for nm in funcs)
+        p4 = psi ** 4
+        g[0, 0] = -N ** 2 + p4 * (f ** 2 * c ** 2 + h ** 2 * w)
+        g[0, 1] = g[1, 0] = p4 * f * c
+        g[0, 2] = g[2, 0] = p4 * r * h
+        g[1, 1], g[2, 2], g[3, 3] = p4, p4 * r ** 2 / w, p4 * r ** 2 * w
+        frame = {0: [1 / N, -f * c / N, -h * w / (N * r), 0], 1: [0, 1 / psi ** 2, 0, 0],
+                 2: [0, 0, -1 / (psi ** 2 * r), 0], 3: [0, 0, 0, 1 / (psi ** 2 * r)]}
+        names = {0: "f0", 1: "f1", 2: "f2", 3: "f3"}
+        atoms, keys, tag = [r, N, psi, w], DRAG_KEYS, {k: "%d%d" % k for k in DRAG_KEYS}
+        args = [a for a in DRAG_ARGS if a not in ("r", "c", "s", "b", "b_t")]
+        zero = {}
+    others = [c] + [jet[a] for a in args if jet[a] not in atoms] + ([jet[nm + "_uu"] for nm in funcs] if rocket else [])
+    gen = {k: sp.cancel(v.subs(zero)) for k, v in closed_shell(family, {}, [])[0].items()}
+    return dict(x0="u" if rocket else "t", w=w, atoms=atoms, others=others, rules=rules, g=g, frame=frame,
+                names=names, keys=keys, tag=tag, args=args, gen=gen,
+                extras=[str(v) for v in others if str(v).endswith("_uu")])
+
+
+def rocq_rx(text, forms, values):
+    """Rocq source of the rx expression that the Rocq term `text` over the reals converts to, read as Rocq reads it:
+    `values` maps a variable to the source of its rx, and `forms` a definition's name to its parameters and body, which
+    are unfolded."""
+    tokens = re.findall(r"[A-Za-z_][\w']*|\d+|\S", text)
+    at = [0]
+
+    def peek():
+        return tokens[at[0]] if at[0] < len(tokens) else None
+
+    def take():
+        at[0] += 1
+        return tokens[at[0] - 1]
+
+    def total():
+        left = product()
+        while peek() in ("+", "-"):
+            left = "(%s %s %s)" % ("RAdd" if take() == "+" else "RSub", left, product())
+        return left
+
+    def product():
+        left = unary()
+        while peek() in ("*", "/"):
+            left = "(%s %s %s)" % ("RMul" if take() == "*" else "RDiv", left, unary())
+        return left
+
+    def unary():
+        # Rocq reads a minus sign before a numeral as a negative numeral
+        if peek() == "-":
+            take()
+            x = unary()
+            m = re.fullmatch(r"\(RZ (\d+)\)", x)
+            return "(RZ (-%s))" % m.group(1) if m and m.group(1) != "0" else "(RNeg %s)" % x
+        if peek() == "/":
+            take()
+            return "(RInv %s)" % unary()
+        x = application()
+        if peek() == "^":
+            take()
+            return "(RPow %s %d)" % (x, int(take()))
+        return x
+
+    def application():
+        token = take()
+        if token == "(":
+            x = total()
+            take()
+            return x
+        if token.isdigit():
+            return "(RZ %s)" % token
+        if token in values:
+            return values[token]
+        params, body = forms[token]
+        args = [application() for _ in params]
+        return rocq_rx(body, forms, dict(zip(params, args)))
+
+    return total()
+
+
+def lp_text(e, atoms, others):
+    """Rocq source of the Laurent polynomial of lp.v that e is, a polynomial in the atoms and the other variables over a
+    monomial in the atoms: its monomials in Rocq's order, each with its exponents and rational coefficient."""
+    e = sp.cancel(sp.sympify(e))
+    if e == 0:
+        return "nil"
+    num, den = sp.fraction(sp.together(e))
+    dpoly = sp.Poly(den, *[a for a in atoms]) if den.free_symbols else None
+    if dpoly is not None and len(dpoly.monoms()) != 1:
+        raise ValueError("the denominator %s is not a monomial in the atoms" % den)
+    dmono, dco = (dpoly.monoms()[0], dpoly.coeffs()[0]) if dpoly is not None else ((0,) * len(atoms), den)
+    terms = {}
+    for mono, co in sp.Poly(sp.expand(num), *(atoms + others)).terms():
+        key = (tuple(z - k for z, k in zip(mono[:len(atoms)], dmono)), tuple(mono[len(atoms):]))
+        terms[key] = terms.get(key, 0) + sp.Rational(co) / sp.Rational(dco)
+
+    def trim(xs):
+        xs = list(xs)
+        while xs and xs[-1] == 0:
+            xs.pop()
+        return xs
+
+    def q_text(q):
+        return "(%d # %d)" % (q.p, q.q) if q.p >= 0 else "((%d) # %d)" % (q.p, q.q)
+
+    # in the order of lp.v's mcmp, which reads a missing exponent as zero
+    items = [(trim(za), trim(no), q) for (za, no), q in sorted(terms.items()) if q != 0]
+    return "(%s :: nil)%%list" % " :: ".join("((%s, %s), %s)" % (
+        "(%s :: nil)%%list" % " :: ".join("(%d)%%Z" % z for z in za) if za else "nil",
+        "(%s :: nil)%%list" % " :: ".join("%d%%nat" % n for n in no) if no else "nil", q_text(q)) for za, no, q in items)
+
+
+@functools.lru_cache(maxsize=None)
+def family_forms(family):
+    """A family's G_* as the certificates write them, the coefficient of each power of c and s in the numerator over
+    the denominator, and as W_*, the same with e_th over sin th and e_ph times it, the powers of s taken as powers of
+    w = s^2: the forms of all, by name, the order of their jets, and each key's powers of e_th and e_ph."""
+    F = einstein_family(family)
+    atoms = [a for a in F["atoms"] if a != F["w"]]
+    forms, power = {}, {}
+    order = [sp.Symbol(a, real=True) for a in sorted(F["args"], key=lambda nm: (len(nm.partition("_")[2]),
+                                                                              F["args"].index(nm)))]
+    for k in F["keys"]:
+        t = F["tag"][k]
+        n2, n3 = sum(1 for x in str(t) if x == "2"), sum(1 for x in str(t) if x == "3")
+        power[k] = (n2, n3)
+        num, den = sp.fraction(sp.cancel(F["gen"][k]))
+        if den.free_symbols - set(atoms) or len(sp.Poly(den, *atoms).monoms()) != 1:
+            raise ValueError("the denominator of the %s family's G_%s is %s" % (family, t, den))
+        poly = sp.Poly(sp.expand(num), SC, SS)
+        gterms, wterms = [], []
+        for j, l in sorted(poly.monoms()):
+            co = poly.coeff_monomial(SC ** j * SS ** l)
+            gens = [v for v in order if v in co.free_symbols]
+            name = "G_%s_%d%d" % (t, j, l)
+            forms[name] = (["r"] + F["args"], "%s / %s" % (
+                rocq_expr(sp.polys.polyfuncs.horner(sp.expand(co), *gens) if gens else co), rocq_expr(den)))
+            part = "%s r %s" % (name, " ".join(F["args"]))
+            gterms.append("c * " * j + "s * " * l + part)
+            if (l - n2 + n3) % 2:
+                raise ValueError("G_%s of the %s family has the power %d of s" % (t, family, l))
+            kw = (l - n2 + n3) // 2
+            wterms.append("c * " * j + ("w ^ %d * " % kw if kw > 0 else "") + part + (" / w ^ %d" % -kw if kw < 0 else ""))
+        forms["G_" + t] = (["r", "c", "s"] + F["args"], " + ".join(gterms) or "0")
+        forms["W_" + t] = (["r", "c", "w"] + F["args"], " + ".join(wterms) or "0")
+    return dict(forms=forms, power=power, args=F["args"])
+
+
+def einstein_lines(family):
+    """The Rocq module proving a family's Einstein tensor on its frame to be its G_*: its metric, inverse, the
+    variables' derivatives and the frame as Laurent polynomials in the variables of `einstein_family`, and its W_*
+    read as expressions rx; the check, run once by vm_compute, computes the Einstein tensor from the metric and its
+    formal derivatives by the curvature formulas and compares it on each pair of frame vectors with W_* modulo
+    c^2 = 1 - w, and the theorems state the result for all values of the variables with w = sin th ^ 2."""
+    F, FF = einstein_family(family), family_forms(family)
+    atoms, others, w, g, keys, tag = F["atoms"], F["others"], F["w"], F["g"], F["keys"], F["tag"]
+    forms, power, args = FF["forms"], FF["power"], FF["args"]
+    wi = atoms.index(w)
+    gi = g.inv().applyfunc(sp.cancel)
+    if (g * gi).applyfunc(sp.cancel) != sp.eye(4):
+        raise ValueError("the inverse metric of the %s family is wrong" % family)
+    cap = family.capitalize()
+    lp = functools.partial(lp_text, atoms=atoms, others=others)
+
+    def table(name, get):
+        rows = ["  | %d%%nat, %d%%nat => %s" % (a, b, lp(get(a, b))) for a in range(4) for b in range(4)
+                if sp.cancel(get(a, b)) != 0]
+        return ["Definition %s (i0 i1 : nat) : lp :=" % name, "  match i0, i1 with"] + rows + [
+            "  | _, _ => nil", "  end.", ""]
+
+    names = [str(v) for v in atoms]
+    onames = [str(v) for v in others]
+    A = " :: ".join(["s * s" if v == w else str(v) for v in atoms]) + " :: nil"
+    O = " :: ".join(onames) + " :: nil"
+    xs = {"u": "u", "t": "t"}[F["x0"]]
+    L = ["(* The %s family's Einstein tensor.  The metric in (%s, r, c, ph), c = cos th, with w = 1 - c^2, over the" % (
+        family, xs),
+         "   atoms %s, held nonzero, and the other variables %s: g_t, its inverse" % (", ".join(names), ", ".join(onames)),
+         "   gi_t, the derivatives of each variable along the four coordinates rules_t, and the frame %s with" % (
+             ", ".join(F["names"][k] for k in F["frame"])),
+         "   e_th over sin th and e_ph times sin th.  The check computes the Einstein tensor of g_t from its first and",
+         "   second formal derivatives by the curvature formulas, on Laurent polynomials, and compares it on each pair",
+         "   of frame vectors with W_*, G_* with the frame's powers of sin th, modulo c^2 = 1 - w. *)",
+         "Module %sEinstein." % cap, ""]
+    L += table("g_t", lambda a, b: g[a, b]) + table("gi_t", lambda a, b: gi[a, b])
+    L += ["Definition rules_t (k : nat) : list lp * list lp :=", "  match k with"]
+    for k in range(4):
+        L.append("  | %d%%nat => ((%s :: nil)%%list, (%s :: nil)%%list)" % (
+            k, " :: ".join(lp(F["rules"].get(v, (0, 0, 0, 0))[k]) for v in atoms),
+            " :: ".join(lp(F["rules"].get(v, (0, 0, 0, 0))[k]) for v in others)))
+    L += ["  | _ => (nil, nil)", "  end.", ""]
+    for k, vec in F["frame"].items():
+        L.append("Definition %s : nat -> lp := fun a => match a with %s | _ => nil end." % (
+            F["names"][k], " ".join("| %d%%nat => %s" % (i, lp(x)) for i, x in enumerate(vec))))
+    L.append("")
+    # the family's G_* and W_*, and W_* read as expressions over the check's variables
+    for name, (params, body) in forms.items():
+        L.append("Definition %s (%s : R) : R := %s." % (name, " ".join(params), body))
+    pos = {str(v): "(RA %d)" % i for i, v in enumerate(atoms)}
+    pos.update({str(v): "(RO %d)" % j for j, v in enumerate(others)})
+    frames = []
+    for k in keys:
+        t = tag[k]
+        L.append("Definition ast_%s : rx := %s." % (t, rocq_rx(forms["W_" + t][1], forms, pos)))
+        frames.append("(%s, %s, ast_%s)" % (F["names"][k[0]], F["names"][k[1]], t))
+    L += ["", "Definition frames_t : list ((nat -> lp) * (nat -> lp) * rx) := (%s :: nil)%%list." % " :: ".join(frames),
+          "", "Lemma check : curv_check (same_rx %d) g_t gi_t rules_t frames_t = true." % wi,
+          "Proof. vm_compute. reflexivity. Qed.", "",
+          "(* the Einstein tensor of g_t on two vectors, with the variables' values A and O *)",
+          "Definition einstein (A O : list R) (va vb : nat -> lp) : R :=",
+          "  along (fun a b => lev A O (g_t a b)) (fun a b => lev A O (gi_t a b))",
+          "    (fun a b k => lev A O (jet1 g_t rules_t a b k)) (fun a b k l => lev A O (jet2 g_t rules_t a b k l))",
+          "    (fun a => lev A O (va a)) (fun b => lev A O (vb b)).", "",
+          "Lemma frame_value A O : List.Forall (fun x => x <> 0) A -> nth 0 O 1 ^ 2 = 1 - nth %d A 1 ->" % wi,
+          "  forall va vb t, In (va, vb, t) frames_t -> einstein A O va vb = rx_eval A O t.",
+          "Proof.",
+          "  intros HA Hc. exact (proj2 (curv_check_correct (same_rx %d) (rx_eval A O) A O g_t gi_t rules_t frames_t HA" % wi,
+          "    (same_rx_correct A O %d HA Hc) check))." % wi, "Qed.", ""]
+    binder = "(r c s %s : R)" % " ".join(args + F["extras"])
+    hyps = ["%s <> 0" % v for v in names if v != str(w)]
+    for i, k in enumerate(keys):
+        t = tag[k]
+        n2, n3 = power[k]
+        lhs = ("s ^ %d * " % n2 if n2 else "") + "einstein (%s) (%s) %s %s" % (A, O, F["names"][k[0]], F["names"][k[1]])
+        rhs = ("s ^ %d * " % n3 if n3 else "") + "G_%s r c s %s" % (t, " ".join(args))
+        L += ["Theorem einstein_%s %s :" % (t, binder),
+              "  %s -> s <> 0 -> s * s = 1 - c ^ 2 ->" % " -> ".join(hyps),
+              "  %s = %s." % (lhs, rhs),
+              "Proof.", "  intros %s Hs Hcs." % " ".join("H%d" % j for j in range(len(hyps))),
+              "  assert (HA : List.Forall (fun x => x <> 0) (%s))" % A,
+              "    by (repeat constructor; try assumption; apply Rmult_integral_contrapositive_currified; assumption).",
+              "  assert (Hc : nth 0 (%s) 1 ^ 2 = 1 - nth %d (%s) 1) by (cbn [nth]; rewrite Hcs; ring)." % (O, wi, A),
+              "  rewrite (frame_value _ _ HA Hc %s %s ast_%s ltac:(unfold frames_t; cbn [In]; %sleft; reflexivity))." % (
+                  F["names"][k[0]], F["names"][k[1]], t, "right; " * i),
+              "  change (rx_eval (%s) (%s) ast_%s) with (W_%s r c (s * s) %s)." % (A, O, t, t, " ".join(args)),
+              "  unfold W_%s, G_%s. field; repeat split; first [assumption | apply pow_nonzero; assumption"
+              " | apply Rmult_integral_contrapositive_currified; assumption]." % (t, t), "Qed.", ""]
+    L += ["End %sEinstein." % cap, ""]
+    return L
+
+
+def einstein_bridge(family, forms, live, same, keys, tag):
+    """The lemmas of a shell's module that tie its G_*, written in the jets that do not vanish on it, to its family's
+    G_* at its jets, each by the normal forms of both as expressions rx, and so its components to the family's
+    Einstein tensor at its jets."""
+    F, FF = einstein_family(family), family_forms(family)
+    mod = "%sEinstein" % family.capitalize()
+    fatoms = [str(v) for v in F["atoms"] if v != F["w"]]
+    atoms = ["r"] + [nm for nm in live if nm in fatoms]
+    others = ["c", "s"] + [nm for nm in live if nm not in fatoms]
+    pos = {nm: "(RA %d)" % i for i, nm in enumerate(atoms)}
+    pos.update({nm: "(RO %d)" % j for j, nm in enumerate(others)})
+
+    def sigma(a):
+        return a if a in live else ("0" if same.get(a, 0) == 0 else same[a])
+
+    fvals = dict(pos, **{a: (pos[sigma(a)] if sigma(a) != "0" else "(RZ 0)") for a in FF["args"]})
+    A, O = " :: ".join(atoms) + " :: nil", " :: ".join(others) + " :: nil"
+    hyps = ["%s <> 0" % nm for nm in atoms]
+    fargs = " ".join(sigma(a) for a in FF["args"])
+    cA = " :: ".join(["s * s" if v == F["w"] else "r" if v == SR else sigma(str(v)) for v in F["atoms"]]) + " :: nil"
+    cO = " :: ".join(["c"] + [sigma(str(v)) for v in F["others"][1:] if str(v) not in F["extras"]] + F["extras"]) + " :: nil"
+    L = ["(* G_* are the %s family's G_* at this shell's jets, and so its Einstein tensor on the frame there *)" % family]
+    for k in keys:
+        t = tag[k]
+        n2, n3 = FF["power"][k]
+        L += ["Definition bridge_%s : rx := %s." % (t, rocq_rx(forms["G_" + t][1], forms, pos)),
+              "Definition bridge_%s_family : rx := %s." % (t, rocq_rx(FF["forms"]["G_" + t][1], FF["forms"], fvals)),
+              "Lemma G_%s_family (r c s %s : R) : %s ->" % (t, " ".join(live), " -> ".join(hyps)),
+              "  G_%s r c s %s = %s.G_%s r c s %s." % (t, " ".join(live), mod, t, fargs),
+              "Proof.", "  intros %s." % " ".join("H%d" % j for j in range(len(hyps))),
+              "  change (rx_eval (%s) (%s) bridge_%s = rx_eval (%s) (%s) bridge_%s_family)." % (A, O, t, A, O, t),
+              "  apply rx_same_correct; [repeat constructor; assumption | vm_compute; reflexivity].", "Qed.", "",
+              "Theorem einstein_%s (r c s %s %s : R) :" % (t, " ".join(live), " ".join(F["extras"])),
+              "  %s -> s <> 0 -> s * s = 1 - c ^ 2 ->" % " -> ".join(hyps),
+              "  %s%s.einstein (%s) (%s) %s.%s %s.%s = %sG_%s r c s %s." % (
+                  "s ^ %d * " % n2 if n2 else "", mod, cA, cO, mod, F["names"][k[0]], mod, F["names"][k[1]],
+                  "s ^ %d * " % n3 if n3 else "", t, " ".join(live)),
+              "Proof.", "  intros. rewrite G_%s_family by assumption. apply %s.einstein_%s; assumption." % (t, mod, t),
+              "Qed.", ""]
     return L
 
 
@@ -7264,24 +9753,49 @@ def compile_proofs(rocq):
     return res.returncode, time.time() - start, res.stdout + res.stderr
 
 
+def certifiable_at(family, mass, eps, shape, bump, verbose):
+    """The certifiable shell of a family at one mass, as cmd_certifiable searches it."""
+    if family == "drag":
+        return certifiable_drag(mass, eps=eps, shape=shape, bump=bump, verbose=verbose)
+    # a search on the default grid can miss a dip of the finer grid's rows; it is run again on one twice as fine
+    return (certifiable_rocket(mass, eps=eps, verbose=verbose)
+            or certifiable_rocket(mass, eps=eps, verbose=verbose, grid=(81, 65)))
+
+
 def cmd_certifiable(args):
-    """Search the closed-form drag shells for the greatest drift their certificate's rows admit, and keep the shell
-    found in results/shells.json, where certify proves it."""
-    found = certifiable_drag(args.mass, eps=args.eps, verbose=args.verbose)
-    if found is None:
-        print("no shell found whose rows hold on the finer grid")
-        return 1
+    """Search the closed-form drag shells at each mass for the greatest drift their certificate's rows admit, or the
+    rocket shells for the greatest acceleration, the masses in processes of their own at once, and keep the shells
+    found in results/shells.json in place of that family's kept before, where certify proves them."""
+    import concurrent.futures
+    kept, missed = {}, []
+    masses = (args.masses or {"drag": "1,1.3,1.6", "rocket": "0.05,0.1,0.2,0.4"}[args.family]).split(",")
+    workers = max(1, min(len(masses), (os.cpu_count() or 2) // 2))
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(certifiable_at, args.family, mass, args.eps, args.shape, args.bump, args.verbose)
+                   for mass in masses]
+        results = [(mass, future.result()) for mass, future in zip(masses, futures)]
+    for mass, found in results:
+        if found is None:
+            print("M = %s: no shell found whose rows hold on the finer grid" % mass, flush=True)
+            missed.append(mass)
+            continue
+        kept[found["M"]] = found
+        if args.family == "drag":
+            print("drag shell M = %s: drift %.4f, least row %.4f on the finer grid; b %s, %s" % (
+                found["M"], found["drift"], found["least_row"], found["b"],
+                ", ".join("%s %s" % (k, " ".join(found[k])) for k in ("f", "h", "p", "k1", "k2"))))
+        else:
+            print("rocket shell M = %s: a R1^2 / M %.4f, least row %.4f on the finer grid" % (
+                found["M"], found["accel_over_mass"], found["least_row"]), flush=True)
     store = load_store()
-    store.setdefault("certified", {})["drag"] = found
+    store.setdefault("certified", {})[args.family] = kept
     save_store(store)
-    print("drag shell M = %s: drift %.4f, least row %.4f on the finer grid; %s" % (
-        found["M"], found["drift"], found["least_row"], ", ".join("%s %s" % (k, found[k]) for k in CertifiableDragProblem.NAMES)))
-    return 0
+    return 1 if missed else 0
 
 
 def cmd_certify(args):
-    """Write into nacelle.v the face theorem and the certificates of the closed-form drag and rocket shells, and of the
-    drag shell nacelle shells certifiable kept."""
+    """Write into nacelle.v the face theorem, the drag and rocket families' Einstein tensors, and the certificates of
+    the closed-form drag and rocket shells and of the drag and rocket shells nacelle shells certifiable kept."""
     with open(PROOFS, encoding="utf-8") as fh:
         head = fh.read()
     if CERTIFIED not in head:
@@ -7291,9 +9805,13 @@ def cmd_certify(args):
         print("face %-6s = %s" % (FACE_NAMES[key], e))
     L = [CERTIFIED,
          "   G_* are the components of 8 pi T in terms of the jets of the profile functions, as derived by nacelle",
-         "   shells derive and compared with automatic differentiation of the metric by nacelle shells selftest. *)", ""]
+         "   shells derive; the modules DragEinstein and RocketEinstein prove them the Einstein tensors of the drag",
+         "   family's metric and of the rocket family's without the dipole of its lapse. *)", ""]
     L += CERTIFICATE_LEMMAS.splitlines() + [""]
+    L += LP_LEMMAS.splitlines() + [""]
     L += face_module()
+    for family in ("drag", "rocket"):
+        L += einstein_lines(family)
     for title, shell in closed_shells(**{name: getattr(args, name) for name in CLOSED_SHELLS}).items():
         lines, exact, rows = certificate_module(**shell)
         print("%s: exact margins %s" % (title, {k: round(v, 3) for k, v in exact.items()}))
@@ -7876,6 +10394,16 @@ def cmd_figure(args):
                         color=ink, fontsize=9)
             series.append(plt.Line2D([], [], color=color, linewidth=2 * px, marker="o", markersize=9 * px,
                                      markeredgecolor=surface, label=label))
+    # the closed-form drag shells nacelle.v proves, whose psi at R2 = 2 is Schwarzschild's 1 + M/4
+    aqua = "#1baf7a"
+    proved = sorted((float(sp.Rational(f["M"])) / (1 + float(sp.Rational(f["M"])) / 4) ** 2, f["drift"])
+                    for f in certified_drag_shells(store))
+    if proved:
+        line(ax, [p[0] for p in proved], [p[1] for p in proved], aqua)
+        ax.annotate("%.2f" % proved[-1][1], proved[-1], xytext=(0, -16), textcoords="offset points", ha="center",
+                    color=ink, fontsize=9)
+        series.append(plt.Line2D([], [], color=aqua, linewidth=2 * px, marker="o", markersize=9 * px,
+                                 markeredgecolor=surface, label="all four conditions, proved in nacelle.v"))
     ax.axhline(1.0, color=axis, linewidth=1 * px)
     ax.annotate("light speed", (1.0, 1.0), xycoords=("axes fraction", "data"), xytext=(-4, 5),
                 textcoords="offset points", ha="right", color=muted, fontsize=9)
@@ -7891,6 +10419,17 @@ def cmd_figure(args):
         line(ax, cx, [r["a_over_newton"] for r in rows], blue)
         ax.annotate("%.2f" % rows[-1]["a_over_newton"], (cx[-1], rows[-1]["a_over_newton"]), xytext=(0, 9),
                     textcoords="offset points", ha="center", color=ink, fontsize=9)
+    proved = sorted((float(sp.Rational(f["M"])), 3 * f["accel_over_mass"]) for f in certified_shells("rocket", store))
+    if proved:
+        # the rocket shells nacelle.v proves, whose compactness 2M/R2 is M for walls out to R2 = 2
+        line(ax, [p[0] for p in proved], [p[1] for p in proved], "#1baf7a")
+        ax.annotate("%.2f" % proved[-1][1], proved[-1], xytext=(0, -16), textcoords="offset points", ha="center",
+                    color=ink, fontsize=9)
+        ax.legend(handles=[plt.Line2D([], [], color=c, linewidth=2 * px, marker="o", markersize=9 * px,
+                                      markeredgecolor=surface, label=lab)
+                           for c, lab in ((blue, "all four conditions"),
+                                          ("#1baf7a", "all four conditions, proved in nacelle.v"))],
+                  loc="center right", frameon=False, fontsize=9, labelcolor=ink2)
     if "0.90" in store["flights"]:
         fl = store["flights"]["0.90"]["rows"]
         u = [r["u"] for r in fl]
@@ -8029,8 +10568,12 @@ def _shells_options(parser: argparse.ArgumentParser) -> None:
     d.add_argument("--rocq", default="rocq", help="path of the rocq executable")
     d.set_defaults(shells_command=cmd_certify)
     d = sub.add_parser("certifiable", help=cmd_certifiable.__doc__)
-    d.add_argument("--mass", default=CLOSED_SHELLS["mass"], help="mass of the drag shell")
+    d.add_argument("--family", choices=("drag", "rocket"), default="drag", help="the family to search")
+    d.add_argument("--masses", default=None,
+                   help="masses of the shells, by default the drift table's for drag and the rocket table's for rocket")
     d.add_argument("--eps", type=float, default=0.15, help="relative margin the search holds every row to")
+    d.add_argument("--shape", type=int, default=3, help="degree of the shapes of the shift profiles f and h")
+    d.add_argument("--bump", type=int, default=1, help="degree of the bump in the conformal factor psi")
     d.add_argument("--verbose", action="store_true")
     d.set_defaults(shells_command=cmd_certifiable)
     d = sub.add_parser("verify", help=cmd_verify.__doc__)
