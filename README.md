@@ -48,7 +48,7 @@ The closed-form rocket shell flown from rest with the least exhaust its family a
 
 ## Proofs
 
-`nacelle.v` proves the energy conditions of a Hawking-Ellis type I tensor, that the Maxwell stress tensor obeys the null and dominant conditions, and the flat-slice theorem: with flat spatial slices and any lapse, the integral of `alpha^2 rho` is minus the integral of `|curl beta|^2` over 32 pi, so such a spacetime cannot be built from positive energy. Its certificate theorems give all four energy conditions from two diagonally dominant matrix pencils, or from Sylvester's criterion on them, for every causal vector. The face theorem shows that the dominant condition keeps a cavity's drift below the local light speed where a wall meets its cavity, and the last part of the file, written by `nacelle shells certify`, proves the four conditions at every point of the walls of a closed-form drag shell and a closed-form rocket shell. The command writes out the expression trees that the tactics of Interval and of field would build, and the kernel runs Interval's bisection and field's normalisation on them.
+`nacelle.v` proves the energy conditions of a Hawking-Ellis type I tensor, that the Maxwell stress tensor obeys the null and dominant conditions, and the flat-slice theorem: with flat spatial slices and any lapse, the integral of `alpha^2 rho` is minus the integral of `|curl beta|^2` over 32 pi, so such a spacetime cannot be built from positive energy. Its certificate theorems give all four energy conditions from two diagonally dominant matrix pencils, or from Sylvester's criterion on them, for every causal vector. The face theorem shows that the dominant condition keeps a cavity's drift below the local light speed where a wall meets its cavity, and the last part of the file, written by `nacelle shells certify`, proves the four conditions at every point of the walls of a closed-form drag shell, a closed-form rocket shell and the drag shell that `nacelle shells certifiable` finds, the one of greatest drift whose certificate rows hold with a set margin. The command writes out the expression trees that Interval's tactic would build, and the kernel runs Interval's bisection on them.
 
 ## Set-up
 
@@ -72,6 +72,7 @@ nacelle shells drift --masses 1.0,1.3,1.6
 nacelle shells beam --masses 0.05,0.1,0.2,0.4
 nacelle shells flight --speed 0.9
 nacelle shells report --radius 10
+nacelle shells certifiable
 nacelle shells certify --compile
 ```
 

@@ -5352,42 +5352,59 @@ def slp(prob, which=CONDITIONS, eps=0.02, iters=120, rows_max=4000, per_point=8,
 
     The margins are those of a fixed sample of observers (condition_matrices) and, at every point where T is of
     type I, those of the observers that bind each condition there (principal_observers), which are the exact margins.
-    Each step solves a linear program in which the margins may fall short of eps at a cost, and is kept
-    when it raises the merit, the goal less that cost."""
+    A problem with rows(th), an array of relative margins (points, rows), is held to those instead. Each step solves a
+    linear program in which the margins may fall short of eps at a cost, and is kept when it raises the merit, the goal
+    less that cost."""
     jax, jnp = _jax()
-    C = condition_matrices(which)
-    sampled_count = C.shape[0]
-    sampled_flat = C.reshape(sampled_count, 16).T
-    tensor = jax.jit(prob.tensor)
+    if hasattr(prob, "rows"):
+        own = jax.jit(prob.rows)
+        own_jacobian = jax.jit(lambda th, pi, ji: jax.jacfwd(lambda t: prob.rows(t)[pi, ji])(th))
 
-    def norms(T):
-        return jnp.sqrt((T * T).sum((-1, -2)) + 1e-300)
+        def rows_at(th):
+            return np.asarray(own(jnp.asarray(th))), None
 
-    def rows_at(th):
-        """Every row at th, the sampled observers' and then each point's binding observers', with the matrices of
-        the latter; a binding observer's row is infinite where T is not of type I."""
-        T = np.asarray(tensor(jnp.asarray(th)))
-        size = np.sqrt((T * T).sum((-1, -2)) + 1e-300)
-        sampled = (T.reshape(-1, 16) @ sampled_flat) / size[:, None]
-        with np.errstate(invalid="ignore", divide="ignore"):
-            D, ok = principal_observers(T, which)
-            exact = np.einsum("pmab,pab->pm", D, T) / size[:, None]
-        return np.concatenate([sampled, np.where(ok[:, None], exact, np.inf)], axis=1), D
+        def jacobian(th, pi, ji, D):
+            return np.asarray(own_jacobian(jnp.asarray(th), jnp.asarray(pi), jnp.asarray(ji)))
+    else:
+        C = condition_matrices(which)
+        sampled_count = C.shape[0]
+        sampled_flat = C.reshape(sampled_count, 16).T
+        tensor = jax.jit(prob.tensor)
 
-    def rows_sel(th, pi, Ck):
-        T = prob.tensor(th)[pi]
-        return jnp.einsum("kab,kab->k", T, Ck) / norms(T)
+        def norms(T):
+            return jnp.sqrt((T * T).sum((-1, -2)) + 1e-300)
 
-    def rows_chain(th, pi, Ck):
-        # the Jacobian of the selected rows from a problem's own derivative of T, each row with its own matrix
-        T, dT = prob.tensor_jacobian(th)
-        Tk, dTk = T[pi], dT[pi]
-        nk = norms(Tk)
-        cT = jnp.einsum("kab,kab->k", Tk, Ck)
-        return (jnp.einsum("kabn,kab->kn", dTk, Ck) / nk[:, None]
-                - (cT / nk ** 3)[:, None] * jnp.einsum("kabn,kab->kn", dTk, Tk))
+        def rows_at(th):
+            """Every row at th, the sampled observers' and then each point's binding observers', with the matrices
+            of the latter; a binding observer's row is infinite where T is not of type I."""
+            T = np.asarray(tensor(jnp.asarray(th)))
+            size = np.sqrt((T * T).sum((-1, -2)) + 1e-300)
+            sampled = (T.reshape(-1, 16) @ sampled_flat) / size[:, None]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                D, ok = principal_observers(T, which)
+                exact = np.einsum("pmab,pab->pm", D, T) / size[:, None]
+            return np.concatenate([sampled, np.where(ok[:, None], exact, np.inf)], axis=1), D
 
-    jac = jax.jit(rows_chain if hasattr(prob, "tensor_jacobian") else jax.jacfwd(rows_sel))
+        def rows_sel(th, pi, Ck):
+            T = prob.tensor(th)[pi]
+            return jnp.einsum("kab,kab->k", T, Ck) / norms(T)
+
+        def rows_chain(th, pi, Ck):
+            # the Jacobian of the selected rows from a problem's own derivative of T, each row with its own matrix
+            T, dT = prob.tensor_jacobian(th)
+            Tk, dTk = T[pi], dT[pi]
+            nk = norms(Tk)
+            cT = jnp.einsum("kab,kab->k", Tk, Ck)
+            return (jnp.einsum("kabn,kab->kn", dTk, Ck) / nk[:, None]
+                    - (cT / nk ** 3)[:, None] * jnp.einsum("kabn,kab->kn", dTk, Tk))
+
+        jac = jax.jit(rows_chain if hasattr(prob, "tensor_jacobian") else jax.jacfwd(rows_sel))
+
+        def jacobian(th, pi, ji, D):
+            among = ji < sampled_count
+            Ck = np.where(among[:, None, None], C[np.where(among, ji, 0)], D[pi, np.where(among, 0, ji - sampled_count)])
+            return np.asarray(jac(jnp.asarray(th), jnp.asarray(pi), jnp.asarray(Ck)))
+
     goal = jax.jit(prob.goal)
     grad = jax.jit(jax.grad(prob.goal))
     th = np.asarray(prob.initial() if th0 is None else th0, dtype=float)
@@ -5416,9 +5433,7 @@ def slp(prob, which=CONDITIONS, eps=0.02, iters=120, rows_max=4000, per_point=8,
         k = min(rows_max, int(np.isfinite(values).sum()))
         chosen = np.argpartition(values, k - 1)[:k]
         pi, ji = np.repeat(np.arange(c.shape[0]), per_point)[chosen], near.ravel()[chosen]
-        among = ji < sampled_count
-        Ck = np.where(among[:, None, None], C[np.where(among, ji, 0)], D[pi, np.where(among, 0, ji - sampled_count)])
-        Jm = np.asarray(jac(jnp.asarray(th), jnp.asarray(pi), jnp.asarray(Ck)))
+        Jm = jacobian(th, pi, ji, D)
         g = np.asarray(grad(jnp.asarray(th)))
         sc = prob.scales(th)
         Js, gs = Jm * sc, g * sc
@@ -6633,9 +6648,7 @@ def exhaust_check(rng, lmax=3):
 # --- closed-form shells and their Rocq certificates --------------------------
 
 SR, SC, SS = sp.symbols("r c s", real=True)
-# the depth r - 1 into a wall from r = 1 to r = 2, in which the certificates write their rational functions: in r
-# their coefficients reach 1e15 with alternating signs, Interval's bisection must cut the wall far finer, and field's
-# normalisation expands every power of r - 1
+# the depth r - 1 into a wall from r = 1 to r = 2, in which the certificates write their rational functions of r
 SX = sp.Symbol("x", real=True)
 ORTHO = "EadSxTP"
 
@@ -6667,19 +6680,19 @@ def rocq_expr(e):
     raise ValueError("cannot print %r" % e)
 
 
-def horner2(p, x, y):
-    """Nested Horner form in x with coefficients in Horner form in y."""
+def horner_form(p, x):
+    """A polynomial in x in Horner form."""
     out = sp.Integer(0)
     for co in sp.Poly(p, x).all_coeffs():
-        out = out * x + (sp.horner(co, y) if co.has(y) else co)
+        out = out * x + co
     return out
 
 
 def rocq_frac(e, integral=False):
     """Rocq source for a rational function of r: its numerator in Horner form in the depth r - 1, over its
     denominator factored in that depth. With `integral` the numerator has integer coefficients and every factor
-    of the denominator a positive constant term, so that the factors that jets share read alike and field's
-    normalisation cancels them."""
+    of the denominator a positive constant term, so that the factors that jets share read alike and field cancels
+    them in the derivative lemmas."""
     num, den = sp.fraction(sp.cancel(sp.together(e)))
     if integral and num.free_symbols:
         scale, num = sp.Poly(num, *sorted(num.free_symbols, key=str)).clear_denoms()
@@ -6697,7 +6710,7 @@ def rocq_frac(e, integral=False):
         den = sp.Mul(coeff, *powers)
     else:
         den = sp.factor(in_depth(den))
-    num = horner2(num, SX, SC) if num.has(SX) else num
+    num = horner_form(num, SX) if num.has(SX) else num
     return rocq_expr(num) if den == 1 else "%s / %s" % (rocq_expr(num), rocq_expr(den))
 
 
@@ -6714,16 +6727,16 @@ SECTION_FORMS = {
     "trace": ("E Sr Th Ph", "- E + Sr + Th + Ph"),
 }
 # Each definition applied to a certificate's components tE ... tP, its section's variables E a d Sr x Th Ph, and to lam.
-_SECTION_ARGUMENTS = dict(zip("E a d Sr x Th Ph".split(), ("(t%s r c)" % k for k in ORTHO)), lam="(lam r)")
+_SECTION_ARGUMENTS = dict(zip("E a d Sr x Th Ph".split(), ("(t%s r th)" % k for k in ORTHO)), lam="(lam r)")
 SECTION_APPLIED = {name: " ".join([name] + [_SECTION_ARGUMENTS[p] for p in params.split()])
                    for name, (params, _) in SECTION_FORMS.items()}
 # What `certified` requires to be non-negative, in the order of its hypotheses: diagonal dominance of T + mu eta with
 # mu >= 0 and the strong condition's bound on mu, then that of lam eta - T eta T with lam >= 0.
 CERTIFICATE_ROWS = (
-    ("n0", "tE r c - mu r - Rabs (ta r c) - Rabs (td r c)"),
-    ("n1", "tS r c + mu r - Rabs (ta r c) - Rabs (tx r c)"),
-    ("n2", "tT r c + mu r - Rabs (td r c) - Rabs (tx r c)"),
-    ("n3", "tP r c + mu r"),
+    ("n0", "tE r th - mu r - Rabs (ta r th) - Rabs (td r th)"),
+    ("n1", "tS r th + mu r - Rabs (ta r th) - Rabs (tx r th)"),
+    ("n2", "tT r th + mu r - Rabs (td r th) - Rabs (tx r th)"),
+    ("n3", "tP r th + mu r"),
     ("m", "mu r"),
     ("s", "mu r + {trace} / 2"),
     ("d0", "{D00} - Rabs ({D01}) - Rabs ({D02})"),
@@ -6732,20 +6745,18 @@ CERTIFICATE_ROWS = (
     ("d3", "{D33}"),
     ("l", "lam r"),
 )
-WALL = (("var", 0), ("var", 1))  # the trees of r and c on the wall
-# The atoms of field's expressions: the depth r - 1, in which field normalises, then r, c and s.
-DEPTH = {"r": ("var", 1), "c": ("var", 2), "s": ("var", 3)}
-DEPTH_ATOM = ("op2", "Sub", ("var", 1), ("int", 1))
+WALL = (("var", 0), ("var", 1))  # the trees of r and of the polar angle th on the wall
+TREE_FUNCTIONS = {"Rabs": "Abs", "sqrt": "Sqrt", "cos": "Cos", "sin": "Sin"}  # Rocq's functions, by Interval's name
 
 
 def term_tree(text, forms, values, shared=None, standard=WALL):
-    """The tree of the Rocq term `text` over the reals, as the reifiers of Interval and of field build it, so that
-    the tree's value converts to the term.
+    """The tree of the Rocq term `text` over the reals, as Interval's reifier builds it, so that the tree's value
+    converts to the term.
 
     `forms` maps a definition's name to its parameters and body, which are unfolded, and `values` a variable to
     its tree. `shared` maps a definition to the name of its tree where it is applied to the trees `standard`, or to
-    the first of them. A tree is a nested tuple, written out by `tree_text` for Interval and `field_text` for
-    field; `x * x` is a square, as Interval's reifier has it.
+    the first of them. A tree is a nested tuple, written out by `tree_text`; `x * x` is a square, as Interval's
+    reifier has it.
     """
     tokens = re.findall(r"[A-Za-z_][\w']*|\d+|\S", text)
     at = [0]
@@ -6794,8 +6805,8 @@ def term_tree(text, forms, values, shared=None, standard=WALL):
             return x
         if token.isdigit():
             return ("int", int(token))
-        if token in ("Rabs", "sqrt"):
-            return ("op1", "Abs" if token == "Rabs" else "Sqrt", application())
+        if token in TREE_FUNCTIONS:
+            return ("op1", TREE_FUNCTIONS[token], application())
         if token in values:
             return values[token]
         params, body = forms[token]
@@ -6840,41 +6851,21 @@ def tree_value(tree, variables, refs):
     return TREE_BINARY[tree[1]](x, tree_value(tree[3], variables, refs))
 
 
-TREE_UNARY = {"Sqr": lambda x: x * x, "Neg": np.negative, "Inv": lambda x: 1.0 / x, "Abs": np.abs, "Sqrt": np.sqrt}
+TREE_UNARY = {"Sqr": lambda x: x * x, "Neg": np.negative, "Inv": lambda x: 1.0 / x, "Abs": np.abs, "Sqrt": np.sqrt,
+              "Cos": np.cos, "Sin": np.sin}
 TREE_BINARY = {"Add": np.add, "Sub": np.subtract, "Mul": np.multiply, "Div": np.divide}
 
 
-def field_text(tree):
-    """Rocq source for a tree of `term_tree`, as field's FExpr over Z; the variable k is the list's (k + 1)th, and
-    r - 1 is the first."""
-    if tree == DEPTH_ATOM:
-        return "(FEX _ 1)"
-    kind = tree[0]
-    if kind == "int":
-        return "(FEc %s%%Z)" % (tree[1] if tree[1] >= 0 else "(%d)" % tree[1])
-    if kind == "var":
-        return "(FEX _ %d)" % (tree[1] + 1)
-    if kind == "ref":
-        return tree[1]
-    if kind == "pow":
-        return "(FEpow %s (Npos %d))" % (field_text(tree[2]), tree[1])
-    if kind == "op1":
-        inner = field_text(tree[2])
-        return {"Sqr": "(FEmul %s %s)" % (inner, inner), "Neg": "(FEopp %s)" % inner, "Inv": "(FEinv %s)" % inner}[tree[1]]
-    return "(FE%s %s %s)" % (tree[1].lower(), field_text(tree[2]), field_text(tree[3]))
-
-
-# What the certificates' rows and closed forms are proved with: Interval's bisection and field's normalisation,
-# which their tactics run on the trees they reify, run here on the trees that `term_tree` writes, and checked once,
-# by the kernel at Qed.
+# What the certificates' rows are proved with: Interval's bisection, which its tactic runs on the trees it reifies, run
+# here on the trees that `term_tree` writes, and checked once, by the kernel at Qed.
 CERTIFICATE_LEMMAS = """\
-(* Interval's bisection on the tree of an expression e, over the wall 1 <= r <= 2, -1 <= c <= 1 cut in r and in c
-   to a depth of 40, for the goal 0 <= e.  The rows of the certificates below are proved with it: nacelle shells
-   certify writes each row's tree, which Interval's tactic would build by reification, and the kernel runs the
-   bisection once, at Qed, on its virtual machine. *)
+(* Interval's bisection on the tree of an expression e, over the wall 1 <= r <= 2, 0 <= th <= PI cut twice in r for
+   each cut in th to a depth of 40, for the goal 0 <= e.  The rows of the certificates below are proved with it:
+   nacelle shells certify writes each row's tree, which Interval's tactic would build by reification, and the kernel
+   runs the bisection once, at Qed, on its virtual machine. *)
 Definition wall_hyps : list (list Reify.hyp) :=
   ((Reify.Hlele true true (Tree.Econst (Tree.Int 1)) (Tree.Econst (Tree.Int 2)) :: nil)
-   :: (Reify.Hlele true true (Tree.Econst (Tree.Int (-1))) (Tree.Econst (Tree.Int 1)) :: nil) :: nil)%list.
+   :: (Reify.Hlele true true (Tree.Econst (Tree.Int 0)) (Tree.Econst Tree.Pi) :: nil) :: nil)%list.
 
 Definition wall_goal : Reify.gol := Reify.Gge true (Tree.Econst (Tree.Int 0)).
 
@@ -6885,76 +6876,119 @@ Definition wall_check (e : Tree.expr) : bool :=
   end.
 
 Lemma wall_nonneg e : wall_check e = true ->
-  forall r c, 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= Tree.eval e (r :: c :: nil).
+  forall r th, 1 <= r <= 2 -> 0 <= th <= PI -> 0 <= Tree.eval e (r :: th :: nil).
 Proof.
-  intros H r c. generalize (Prog.extract_correct e (r :: c :: nil)%list).
-  change (length (r :: c :: nil)%list) with 2%nat. unfold wall_check in H.
+  intros H r th. generalize (Prog.extract_correct e (r :: th :: nil)%list).
+  change (length (r :: th :: nil)%list) with 2%nat. unfold wall_check in H.
   destruct (Prog.extract e 2) as [|lp lc]; [discriminate |].
-  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 0%nat :: 1%nat :: nil)%list (r :: c :: nil)%list
+  intros <-. exact (Private.IT2.IH.eval_bisect_correct 53%Z 40 (0%nat :: 0%nat :: 1%nat :: nil)%list (r :: th :: nil)%list
                       wall_hyps lp lc wall_goal H).
 Qed.
 
-Ltac wall e r c :=
+Ltac wall e r th :=
   let H := fresh in
   assert (H : wall_check e = true) by vm_cast_no_check (eq_refl true);
-  exact_no_check (wall_nonneg e H r c).
+  exact_no_check (wall_nonneg e H r th).
 
-(* field's normalisation of the two sides of an identity in r, c and s, written out as field's expressions over the
-   atoms r - 1, r, c and s, with r replaced by (r - 1) + 1, so that the normal forms are polynomials in the depth
-   r - 1.  The closed forms of the certificates below are proved with it, the kernel comparing the normal forms
-   once, at Qed, and the denominators shown nonzero by Interval. *)
-Definition depth_subst : list (Ring_polynom.PExpr BinNums.Z * Ring_polynom.PExpr BinNums.Z) :=
-  ((Ring_polynom.PEX _ 2, Ring_polynom.PEadd (Ring_polynom.PEX _ 1) (Ring_polynom.PEc 1%Z)) :: nil)%list.
-
-Definition field_check (fe1 fe2 : FExpr BinNums.Z) : bool :=
-  let lmp := Ring_polynom.mk_monpol_list 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb Z.quotrem depth_subst in
-  let n1 := Fnorm 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb fe1 in
-  let n2 := Fnorm 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb fe2 in
-  Ring_polynom.Peq Z.eqb
-    (Ring_polynom.norm_subst 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb Z.quotrem ring_subst_niter lmp
-       (Ring_polynom.PEmul (num n1) (denum n2)))
-    (Ring_polynom.norm_subst 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb Z.quotrem ring_subst_niter lmp
-       (Ring_polynom.PEmul (num n2) (denum n1))).
-
-Definition field_conds (l : list R) (fe1 fe2 : FExpr BinNums.Z) : Prop :=
-  PCond 0 1 Rplus Rmult Rminus Ropp eq IZR BinNat.N.to_nat pow l
-    (condition (Fnorm 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb fe1)
-     ++ condition (Fnorm 0%Z 1%Z Z.add Z.mul Z.sub Z.opp Z.eqb fe2)).
-
-Lemma field_identity r c s fe1 fe2 :
-  field_check fe1 fe2 = true -> field_conds (r - 1 :: r :: c :: s :: nil)%list fe1 fe2 ->
-  FEeval 0 1 Rplus Rmult Rminus Ropp Rdiv RinvImpl.Rinv IZR BinNat.N.to_nat pow (r - 1 :: r :: c :: s :: nil)%list fe1 =
-  FEeval 0 1 Rplus Rmult Rminus Ropp Rdiv RinvImpl.Rinv IZR BinNat.N.to_nat pow (r - 1 :: r :: c :: s :: nil)%list fe2.
-Proof.
-  intros H C.
-  refine (RField_field_lemma1 ring_subst_niter _ depth_subst fe1 fe2 _ _ eq_refl _ eq_refl _ eq_refl H C).
-  cbn. ring.
-Qed.
-
-Ltac nonzero := repeat split; first [ exact I | lra | apply Rgt_not_eq; interval | apply Rlt_not_eq; interval ].
-
-Ltac identity r c s fe1 fe2 :=
-  let N := fresh in
-  let C := fresh in
-  assert (N : field_check fe1 fe2 = true) by vm_cast_no_check (eq_refl true);
-  assert (C : field_conds (r - 1 :: r :: c :: s :: nil)%list fe1 fe2)
-    by (unfold field_conds; apply RField_lemma5; intros lock lock_def; vm_compute; rewrite lock_def;
-        clear lock lock_def; cbn [PCond Ring_polynom.PEeval BinList.nth BinList.jump List.tl List.hd
-                                  BinNat.N.to_nat BinPos.Pos.to_nat BinPos.Pos.iter_op Nat.add]; nonzero);
-  exact_no_check (field_identity r c s fe1 fe2 N C).
+(* the side conditions of auto_derive and field in the derivative lemmas: each a denominator shown nonzero on the
+   wall by Interval *)
+Ltac nonzero r := repeat split;
+  first [ exact I | lra | apply Rgt_not_eq; interval with (i_bisect r) | apply Rlt_not_eq; interval with (i_bisect r) ].
 """
 
 
-def drag_closed_jets(M, b):
-    """Jets of the closed-form drag shell on 1 <= r <= 2: psi = 1 + 5M/16 - M x^2/16, N = (2 - psi)/psi, f = h = b (1 - 3x^2 + 2x^3), x = r - 1."""
+def drag_closed_jets(M, b, f=(0, 0), h=(0, 0)):
+    """Jets of a closed-form drag shell on 1 <= r <= 2, x = r - 1: psi = 1 + 5M/16 - M x^2/16, N = (2 - psi)/psi,
+    f = b (S + B (f0 + f1 x)) and h = b (S + B (h0 + h1 x)) with S = 1 - 3x^2 + 2x^3 and B = x^2 (1 - x)^2. B and its
+    slope vanish at both faces, so f and h meet a flat cavity drifting at b inside and the exterior at rest as the
+    closed-form shell's f = h = b S does."""
     x = SR - 1
+    S, B = 1 - 3 * x ** 2 + 2 * x ** 3, x ** 2 * (1 - x) ** 2
     psi = 1 + sp.Rational(5, 16) * M - sp.Rational(1, 16) * M * x ** 2
-    f = sp.expand(b * (1 - 3 * x ** 2 + 2 * x ** 3))
+    profiles = (("N", (2 - psi) / psi), ("psi", psi), ("f", b * (S + B * (f[0] + f[1] * x))),
+                ("h", b * (S + B * (h[0] + h[1] * x))))
     out = {}
-    for nm, e in (("N", sp.cancel((2 - psi) / psi)), ("psi", psi), ("f", f), ("h", f)):
+    for nm, e in profiles:
         for k, suf in enumerate(("", "_r", "_rr")):
             out[nm + suf] = sp.cancel(sp.diff(e, SR, k))
     return out
+
+
+class CertifiableDragProblem:
+    """The search for a closed-form drag shell that its certificate proves: `drag_closed_jets` with the parameters
+    b, f0, f1, h0 and h1, and the multipliers mu = k1 rho and lam = k2 rho^2 of `certified`, rho the static density.
+    The goal is the drift of the cavity's free-fall frame, b psi0^2 / N0 at the inner face. The rows are those of
+    `certified`, each sum of absolute values written as its four sums of signs, relative to rho, or to rho^2 for those
+    of lam eta - T eta T, at nr radii and nc cosines over the wall."""
+
+    NAMES = ("b", "f0", "f1", "h0", "h1", "k1", "k2")
+
+    def __init__(self, M, nr=41, nc=17):
+        self.jnp = jnp = _jax()[1]
+        self.M = sp.Rational(M)
+        rg, cg = np.meshgrid(wall_radii(1.0, 2.0, nr), np.linspace(-1.0, 1.0, nc), indexing="ij")
+        self.r, self.c = jnp.asarray(rg), jnp.asarray(cg)
+        p = sp.symbols(" ".join(self.NAMES[:5]), real=True)
+        jets = drag_closed_jets(self.M, p[0], p[1:3], p[3:5])
+        self.names = list(jets)
+        self.jets = sp.lambdify([SR, *p], [jets[k] for k in self.names], "jax")
+        self.rho = self.tensors(jnp.zeros(5))[..., 0, 0]
+
+    def initial(self):
+        """The closed-form drag shell of the certificates."""
+        return np.array([0.01, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5])
+
+    def scales(self, th):
+        """Trust-region scale of each parameter."""
+        return np.array([max(abs(th[0]), 1e-3), 1.0, 1.0, 1.0, 1.0, 0.2, 0.2])
+
+    def tensors(self, th):
+        """8 pi T at the sample points."""
+        jnp = self.jnp
+        vals = {k: jnp.broadcast_to(v, self.r.shape) for k, v in zip(self.names, self.jets(self.r, *th[:5]))}
+        vals.update(r=self.r, c=self.c, s=jnp.sqrt(jnp.maximum(1 - self.c ** 2, 0.0)), b=1.0, b_t=0.0)
+        return 8 * jnp.pi * family_tensor("drag", vals, "jax")
+
+    def rows(self, th):
+        """The rows at every sample point, as an array (points, rows)."""
+        jnp = self.jnp
+        T, rho = self.tensors(th), self.rho
+        E, a, d, S, x, Th, P = (T[..., i, j] for i, j in DRAG_KEYS)
+        mu, lam = th[5] * rho, th[6] * rho ** 2
+        D00, D01, D02 = -lam + E * E - a * a - d * d, E * a - a * S - d * x, E * d - a * x - d * Th
+        D11, D12, D22 = lam + a * a - S * S - x * x, a * d - x * (S + Th), lam + d * d - x * x - Th * Th
+        out = [(P + mu) / rho, (mu + (-E + S + Th + P) / 2) / rho, (lam - P * P) / rho ** 2, th[5] + 0 * rho,
+               th[6] + 0 * rho]
+        for s1, s2 in itertools.product((1.0, -1.0), repeat=2):
+            out += [(E - mu - s1 * a - s2 * d) / rho, (S + mu - s1 * a - s2 * x) / rho,
+                    (Th + mu - s1 * d - s2 * x) / rho, (D00 - s1 * D01 - s2 * D02) / rho ** 2,
+                    (D11 - s1 * D01 - s2 * D12) / rho ** 2, (D22 - s1 * D02 - s2 * D12) / rho ** 2]
+        return jnp.stack([row.ravel() for row in out], axis=1)
+
+    def goal(self, th):
+        """The drift of the cavity's free-fall frame, psi0^2 b / N0 with N0 = (2 - psi0) / psi0."""
+        psi0 = 1 + 5 * float(self.M) / 16
+        return th[0] * psi0 ** 3 / (2 - psi0)
+
+
+def certifiable_drag(M, eps=0.15, verbose=False):
+    """The closed-form drag shell of mass M of greatest drift that its certificate's rows admit with relative margin
+    eps, found by `slp` from the certificates' closed-form drag shell. Its parameters are rounded to fractions over
+    powers of 2, which keep the integers of its jets short, and its amplitude lowered when that is needed
+    for its rows to hold above eps / 4 on a grid four times finer. Returns the parameters as fractions, the mass, the
+    drift and that least row, or None."""
+    prob = CertifiableDragProblem(M)
+    th, _ = slp(prob, eps=eps, verbose=verbose)
+    finer = CertifiableDragProblem(M, 161, 65)
+    for shrink in (1.0, 0.99, 0.97, 0.94, 0.9):
+        exact = [sp.Rational(round(v * 2**8), 2**8) for v in th]
+        exact[0] = sp.Rational(round(th[0] * shrink * 2**16), 2**16)
+        values = np.array([float(v) for v in exact])
+        least = float(np.asarray(finer.rows(values)).min())
+        if least > eps / 4:
+            return {"M": str(sp.Rational(M)), **{k: str(v) for k, v in zip(prob.NAMES, exact)},
+                    "drift": float(prob.goal(values)), "least_row": least}
+    return None
 
 
 def rocket_closed_jets(delta, a, kappa, adot=0):
@@ -6990,14 +7024,15 @@ def flight_tensor(kappa):
     return tensor
 
 
-def closed_shell(family, jets):
-    """Generic 8 pi T of a family in jet symbols, and the same on a closed-form shell, by component key."""
-    fn, argnames, keys = FAMILIES[family]
+def closed_shell(family, jets, keys=None):
+    """Generic 8 pi T of a family in jet symbols, and the components `keys` (all by default) of the same on a
+    closed-form shell, by component key."""
+    fn, argnames, family_keys = FAMILIES[family]
     T = closed_forms(family)
     fix = {sp.Symbol("b", real=True): 1, sp.Symbol("b_t", real=True): 0} if family == "drag" else {}
-    gen = {k: sp.cancel(8 * sp.pi * T[k].subs(fix)) for k in keys}
+    gen = {k: sp.cancel(8 * sp.pi * T[k].subs(fix)) for k in family_keys}
     table = {sp.Symbol(k, real=True): v for k, v in jets.items()}
-    return gen, {k: sp.cancel(sp.together(gen[k].subs(table))) for k in keys}
+    return gen, {k: sp.cancel(sp.together(gen[k].subs(table))) for k in (family_keys if keys is None else keys)}
 
 
 def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201, nth=81):
@@ -7006,7 +7041,7 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
     module give, the rows relative to rho, those of lam eta - T eta T to rho^2."""
     fn, argnames, keys = FAMILIES[family]
     jetnames = [a for a in argnames if a not in ("r", "c", "s", "b", "b_t")]
-    gen, X = closed_shell(family, jets)
+    gen, _ = closed_shell(family, jets, ())
     # a jet that vanishes on this shell is zero in G_*, and one equal on it to an earlier jet is that jet there, with no
     # definition or derivative of its own; G_* name the rest
     same = {}
@@ -7032,47 +7067,26 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
     forms = {name: (params.split(), body) for name, (params, body) in SECTION_FORMS.items()}
     L = ["(* %s" % note, "",
          "   G_* are the components of 8 pi T for the %s family in terms of the jets of its profile" % family,
-         "   functions.  Proved here: the components on this shell, the null, weak, strong and dominant energy",
+         "   functions, and j_* the jets of this shell.  Proved here: the null, weak, strong and dominant energy",
          "   conditions for every observer at every point of the wall, and that the radial jets are derivatives",
          "   of one another.%s *)" % reduced, "Module %s." % module, ""]
     binder = "(r c s %s : R)" % " ".join(live)
+    # the numerators of G_* nested in c, s, r and then the jets by the order of their derivatives, which halves the
+    # operations Interval's bisection runs on each box and narrows its enclosures
+    order = [SC, SS, SR] + [sp.Symbol(nm, real=True) for nm in
+                            sorted(live, key=lambda nm: (len(nm.partition("_")[2]), live.index(nm)))]
     for k in keys:
         num, den = sp.fraction(gen[k])
-        forms["G_" + tag[k]] = (["r", "c", "s"] + live, "%s / %s" % (rocq_expr(num), rocq_expr(den)))
+        gens = [v for v in order if v in num.free_symbols]
+        forms["G_" + tag[k]] = (["r", "c", "s"] + live, "%s / %s" % (
+            rocq_expr(sp.polys.polyfuncs.horner(sp.expand(num), *gens) if gens else num), rocq_expr(den)))
         L += ["Definition G_%s %s : R :=\n  %s." % (tag[k], binder, forms["G_" + tag[k]][1]), ""]
     for nm in defined:
         forms["j_" + nm] = (["r"], rocq_frac(jets[nm], integral=True))
         L.append("Definition j_%s (r : R) : R := %s." % (nm, forms["j_" + nm][1]))
     L.append("")
-    for k in keys:
-        num, den = sp.fraction(X[k])
-        num = sp.expand(num)
-        odd = num.has(SS)
-        if odd:
-            num = sp.expand(sp.cancel(num / SS))
-            if num.has(SS):
-                raise ValueError("component %s is not linear in s" % (k,))
-        body = "%s(%s / %s)" % ("s * " if odd else "", rocq_expr(horner2(in_depth(num), SX, SC)),
-                                 rocq_expr(sp.factor(in_depth(den))))
-        L += ["Definition x_%s (r c s : R) : R := %s." % (tag[k], body), ""]
-        forms["x_%s" % tag[k]] = (["r", "c", "s"], body)
-    # field's expressions of the jets, which those of the closed forms' two sides name
-    L.append("(* field's expressions of the jets, of which those of the identities below are built *)")
     jl = " ".join("(j_%s r)" % nm for nm in live)
-    fshared = {}
-    for nm in live:
-        tree = term_tree(forms["j_" + nm][1], forms, {"r": DEPTH["r"]})
-        fshared["j_" + nm] = "fe_" + nm
-        L.append("Definition fe_%s : FExpr BinNums.Z := %s." % (nm, field_text(tree)))
-    L.append("")
-    for k in keys:
-        lhs, rhs = "G_%s r c s %s" % (tag[k], jl), "x_%s r c s" % tag[k]
-        for name, side in (("G", lhs), ("x", rhs)):
-            text = field_text(term_tree(side, forms, DEPTH, fshared, (DEPTH["r"],)))
-            L.append("Definition fe_%s_%s : FExpr BinNums.Z := %s." % (name, tag[k], text))
-        L += ["Lemma x_%s_closed r c s : 1 <= r <= 2 -> %s = %s." % (tag[k], lhs, rhs),
-              "Proof. intros Hr. identity r c s fe_G_%s fe_x_%s. Qed." % (tag[k], tag[k]), ""]
-    xs = {k: "x_%s r c (sqrt (1 - c * c))" % tag[k] for k in keys}
+    xs = {k: "G_%s r (cos th) (sin th) %s" % (tag[k], jl) for k in keys}
     if family == "drag":
         body = dict(zip(ORTHO, [xs[k] for k in keys]))
     else:
@@ -7086,10 +7100,10 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
                 "d": "(H0 r * (%s) / 2 + %s) / sqrt (H0 r)" % (ck2, cl2),
                 "S": "(H0 r * (%s) / 2 - 2 * (%s) + 2 * (%s) / H0 r) / 2" % (ckk, ckl, cll),
                 "x": "(H0 r * (%s) / 2 - (%s)) / sqrt (H0 r)" % (ck2, cl2), "T": c22, "P": c33}
-    L.append("(* the components at radius r and c = cos(theta), with sin(theta) = sqrt (1 - c^2) *)")
+    L.append("(* the components on this shell at radius r and polar angle th *)")
     for k in ORTHO:
-        L.append("Definition t%s (r c : R) : R := %s." % (k, body[k]))
-        forms["t" + k] = (["r", "c"], body[k])
+        L.append("Definition t%s (r th : R) : R := %s." % (k, body[k]))
+        forms["t" + k] = (["r", "th"], body[k])
     forms.update(rho=(["r"], rocq_frac(rho)), mu=(["r"], "%s * rho r" % rocq_expr(k1)),
                  lam=(["r"], "%s * (rho r * rho r)" % rocq_expr(k2)))
     L += [""] + ["Definition %s (r : R) : R := %s." % (name, forms[name][1]) for name in ("rho", "mu", "lam")] + [""]
@@ -7097,7 +7111,7 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
     L.append("(* the trees of rho and of the components, of which the rows' trees are built *)")
     shared, value = {}, {}
     rg, thg = np.meshgrid(wall_radii(1.0, 2.0, nr), np.linspace(0.0, np.pi, nth), indexing="ij")
-    wall = (rg, np.cos(thg))
+    wall = (rg, thg)
     for name in ["rho"] + (["H0"] if "H0" in forms else []) + ["t" + k for k in ORTHO]:
         params, text = forms[name]
         tree = term_tree(text, forms, dict(zip(params, WALL)), shared)
@@ -7108,16 +7122,16 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
     rows, density = {}, value["tree_rho"]
     for nm, stmt in CERTIFICATE_ROWS:
         stmt = stmt.format(**SECTION_APPLIED)
-        tree = term_tree(stmt, forms, {"r": WALL[0], "c": WALL[1]}, shared)
+        tree = term_tree(stmt, forms, {"r": WALL[0], "th": WALL[1]}, shared)
         if nm not in ("m", "l"):
             rows[nm] = float((tree_value(tree, wall, value) / density ** (2 if nm[0] == "d" else 1)).min())
-        L += ["Lemma row_%s r c : 1 <= r <= 2 -> -1 <= c <= 1 -> 0 <= %s." % (nm, stmt),
-              "Proof. wall %s r c. Qed." % tree_text(tree), ""]
-    allg = " ".join("(t%s r c)" % k for k in ORTHO)
+        L += ["Lemma row_%s r th : 1 <= r <= 2 -> 0 <= th <= PI -> 0 <= %s." % (nm, stmt),
+              "Proof. wall %s r th. Qed." % tree_text(tree), ""]
+    allg = " ".join("(t%s r th)" % k for k in ORTHO)
     L += ["(* every energy condition, for every observer, at every point of the wall *)",
-          "Theorem shell_energy_conditions r c : 1 <= r <= 2 -> -1 <= c <= 1 -> energy_conditions %s." % allg,
-          "Proof.", "  intros Hr Hc.", "  apply (certified %s (mu r) (lam r))." % allg]
-    L += ["  - pose proof (row_%s r c Hr Hc). lra." % nm for nm, _ in CERTIFICATE_ROWS] + ["Qed.", ""]
+          "Theorem shell_energy_conditions r th : 1 <= r <= 2 -> 0 <= th <= PI -> energy_conditions %s." % allg,
+          "Proof.", "  intros Hr Hth.", "  apply (certified %s (mu r) (lam r))." % allg]
+    L += ["  - pose proof (row_%s r th Hr Hth). lra." % nm for nm, _ in CERTIFICATE_ROWS] + ["Qed.", ""]
     E, a, d, S, x, T, P = (value["tree_" + k] for k in ORTHO)
     z = np.zeros(rg.shape)
     Tab = np.stack([np.stack(row, -1) for row in ([E, a, d, z], [a, S, x, z], [d, x, T, z], [z, z, z, P])], -2)
@@ -7135,7 +7149,7 @@ def certificate_module(module, family, jets, rho, k1, k2, note, H0=None, nr=201,
         root = nm[: len(nm) - len(suf)] if suf else nm
         if suf in der and root + der[suf] in defined:
             L += ["Lemma j_%s_derive r : 1 <= r <= 2 -> is_derive j_%s r (j_%s r)." % (nm, nm, root + der[suf]),
-                  "Proof.", "  intros Hr. unfold j_%s, j_%s. auto_derive; [ nonzero | field; nonzero ]." % (nm, root + der[suf]),
+                  "Proof.", "  intros Hr. unfold j_%s, j_%s. auto_derive; [ nonzero r | field; nonzero r ]." % (nm, root + der[suf]),
                   "Qed.", ""]
     return L + ["End %s." % module, ""], worst_margins(Tab), rows
 
@@ -7147,11 +7161,12 @@ CLOSED_SHELLS = {"mass": "3/2", "shift": "1/100", "depth": "1/5", "accel": "1/20
 
 
 def closed_shells(mass, shift, depth, accel, kappa, k1, k2):
-    """The closed-form drag and rocket shells, as the arguments of `certificate_module`, by what certify calls them."""
+    """The closed-form drag and rocket shells, and the drag shell `nacelle shells certifiable` keeps in
+    results/shells.json when it has kept one, as the arguments of `certificate_module`, by what certify calls them."""
     M, b = sp.Rational(mass), sp.Rational(shift)
     half = sp.Rational(1, 2)
     drag = dict(module="Drag", family="drag", jets=drag_closed_jets(M, b),
-                rho=closed_shell("drag", drag_closed_jets(M, sp.Integer(0)))[1][(0, 0)], k1=half, k2=half,
+                rho=closed_shell("drag", drag_closed_jets(M, sp.Integer(0)), [(0, 0)])[1][(0, 0)], k1=half, k2=half,
                 note="Drag shell on 1 <= r <= 2 with M = %s and shift amplitude %s." % (M, b))
     dl, a, kap = sp.Rational(depth), sp.Rational(accel), sp.Rational(kappa)
     jets, Mr = rocket_closed_jets(dl, a, kap)
@@ -7159,8 +7174,18 @@ def closed_shells(mass, shift, depth, accel, kappa, k1, k2):
                   k1=sp.Rational(k1), k2=sp.Rational(k2), H0=sp.cancel(1 - 2 * jets["m"] / SR),
                   note="Rocket shell on 1 <= r <= 2 with E = 1 - %s (2 - r), acceleration %s, exhaust factor %s."
                   % (dl, a, kap))
-    return {"drag shell M = %s, shift %s" % (M, b): drag,
-            "rocket shell depth %s (M = %s), acceleration %s, kappa %s" % (dl, Mr, a, kap): rocket}
+    shells = {"drag shell M = %s, shift %s" % (M, b): drag,
+              "rocket shell depth %s (M = %s), acceleration %s, kappa %s" % (dl, Mr, a, kap): rocket}
+    found = load_store().get("certified", {}).get("drag")
+    if found:
+        q = {k: sp.Rational(found[k]) for k in CertifiableDragProblem.NAMES}
+        Mf = sp.Rational(found["M"])
+        shells["searched drag shell M = %s, drift %.4f" % (Mf, found["drift"])] = dict(
+            module="Searched", family="drag", jets=drag_closed_jets(Mf, q["b"], (q["f0"], q["f1"]), (q["h0"], q["h1"])),
+            rho=closed_shell("drag", drag_closed_jets(Mf, sp.Integer(0)), [(0, 0)])[1][(0, 0)], k1=q["k1"], k2=q["k2"],
+            note="Drag shell on 1 <= r <= 2 with M = %s whose shift nacelle shells certifiable found, for a drift of "
+                 "%.4f." % (Mf, found["drift"]))
+    return shells
 
 
 FACE_NAMES = {(0, 0): "E", (0, 1): "T0r", (0, 2): "T0th", (1, 1): "Srr", (1, 2): "Srth", (2, 2): "Sthth",
@@ -7239,8 +7264,24 @@ def compile_proofs(rocq):
     return res.returncode, time.time() - start, res.stdout + res.stderr
 
 
+def cmd_certifiable(args):
+    """Search the closed-form drag shells for the greatest drift their certificate's rows admit, and keep the shell
+    found in results/shells.json, where certify proves it."""
+    found = certifiable_drag(args.mass, eps=args.eps, verbose=args.verbose)
+    if found is None:
+        print("no shell found whose rows hold on the finer grid")
+        return 1
+    store = load_store()
+    store.setdefault("certified", {})["drag"] = found
+    save_store(store)
+    print("drag shell M = %s: drift %.4f, least row %.4f on the finer grid; %s" % (
+        found["M"], found["drift"], found["least_row"], ", ".join("%s %s" % (k, found[k]) for k in CertifiableDragProblem.NAMES)))
+    return 0
+
+
 def cmd_certify(args):
-    """Write into nacelle.v the face theorem and the certificates of the closed-form drag and rocket shells."""
+    """Write into nacelle.v the face theorem and the certificates of the closed-form drag and rocket shells, and of the
+    drag shell nacelle shells certifiable kept."""
     with open(PROOFS, encoding="utf-8") as fh:
         head = fh.read()
     if CERTIFIED not in head:
@@ -7447,7 +7488,7 @@ def cmd_selftest(args):
     good &= check("drag design tensor equals autodiff curvature of its metric", w < 1e-8, "%.1e" % w)
     for shell in closed_shells(**CLOSED_SHELLS).values():
         _, exact, rows = certificate_module(**shell)
-        good &= check("closed-form %s shell: conditions and certificate rows" % shell["family"],
+        good &= check("%s certificate: conditions and rows" % shell["module"],
                       min(exact.values()) > 0 and min(rows.values()) > 0,
                       "%.3f %.3f" % (min(exact.values()), min(rows.values())))
     w = ad_check_beam(rng)
@@ -7479,7 +7520,7 @@ def load_store():
 def save_store(store):
     """Write results/shells.json, replacing it in one step."""
     os.makedirs(os.path.dirname(SHELLS_STORE), exist_ok=True)
-    with open(SHELLS_STORE + ".tmp", "w") as fh:
+    with open(SHELLS_STORE + ".tmp", "w", newline="\n") as fh:
         json.dump(store, fh, indent=1)
     os.replace(SHELLS_STORE + ".tmp", SHELLS_STORE)
 
@@ -7987,6 +8028,11 @@ def _shells_options(parser: argparse.ArgumentParser) -> None:
     d.add_argument("--compile", action="store_true", help="compile nacelle.v once the certificates are written")
     d.add_argument("--rocq", default="rocq", help="path of the rocq executable")
     d.set_defaults(shells_command=cmd_certify)
+    d = sub.add_parser("certifiable", help=cmd_certifiable.__doc__)
+    d.add_argument("--mass", default=CLOSED_SHELLS["mass"], help="mass of the drag shell")
+    d.add_argument("--eps", type=float, default=0.15, help="relative margin the search holds every row to")
+    d.add_argument("--verbose", action="store_true")
+    d.set_defaults(shells_command=cmd_certifiable)
     d = sub.add_parser("verify", help=cmd_verify.__doc__)
     d.set_defaults(shells_command=cmd_verify)
     d = sub.add_parser("exhaust", help=cmd_exhaust.__doc__)
@@ -9505,6 +9551,7 @@ __all__ = [
     "BudgetError",
     "CURVATURE",
     "Cabin",
+    "CertifiableDragProblem",
     "Conformal",
     "DEFAULTS",
     "DESTINATIONS",
@@ -9550,6 +9597,7 @@ __all__ = [
     "bench",
     "bench_mass",
     "build",
+    "certifiable_drag",
     "closed_forms",
     "condition_matrices",
     "conformal_factor",
