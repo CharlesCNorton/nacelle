@@ -8241,7 +8241,7 @@ design = Design(
 
 
 def _slow(test):
-    """Mark a check of a minute or more, which pytest runs only with -m slow."""
+    """Mark a check of half a minute or more, which pytest runs only with -m slow."""
     try:
         import pytest
     except ImportError:
@@ -8249,6 +8249,7 @@ def _slow(test):
     return pytest.mark.slow(test)
 
 
+@_slow
 def test_the_solver_against_closed_forms():
     """`nacelle selftest`, and a level refusing to read outside the region its plan keeps."""
     import pytest
@@ -8332,6 +8333,7 @@ def test_examples_load_by_name():
         assert load_design(name) is not None and design.name == name and not design.problems()
 
 
+@_slow
 def test_a_solid_hull(tmp_path):
     """A ring of the elastic solid at rest and one in motion: built, the solid's flight-app expressions against those
     here, and flown two steps each way."""

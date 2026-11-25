@@ -30,5 +30,5 @@ py-modules = ["nacelle"]
 [tool.pytest.ini_options]
 testpaths = ["nacelle.py"]
 python_files = ["nacelle.py"]
-markers = ["slow: a check of a minute or more, run with -m slow"]
+markers = ["slow: a check of half a minute or more, run with -m slow"]
 addopts = "-m 'not slow'"

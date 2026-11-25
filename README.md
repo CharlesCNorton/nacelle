@@ -80,7 +80,7 @@ nacelle shells certify --compile
 
 ## Verification
 
-`pytest` runs the tests in `nacelle.py`, and `pytest -m slow` adds the shells' self-test. `nacelle selftest` checks the constraint solver against closed forms, `nacelle shells selftest` the shells' closed forms against automatic differentiation of the metric, and `nacelle shells verify` every design in `results/shells.json`. Rocq checks the proofs as `rocq compile nacelle.v` compiles them.
+`pytest` runs the quick tests in `nacelle.py`, and `pytest -m slow` the slow ones: the solver's and the shells' self-tests and the solid hull's flights. `nacelle selftest` checks the constraint solver against closed forms, `nacelle shells selftest` the shells' closed forms against automatic differentiation of the metric, and `nacelle shells verify` every design in `results/shells.json`. Rocq checks the proofs as `rocq compile nacelle.v` compiles them.
 
 ## Licence
 
