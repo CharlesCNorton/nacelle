@@ -16,26 +16,26 @@ A design places differentiable walls, rings, stacks of rings and ellipsoidal she
 
 ## Positive-energy shells
 
-`nacelle shells` builds shells of positive-energy matter around a flat cavity in three metric families: a stationary shell whose wall carries a shift, so that the cavity drifts relative to it; an accelerating shell on a radiation exhaust whose cavity accelerates with it; and an accelerating hull whose exhaust is aimed by the shape of its wavefronts, around a cavity that stays inertial. Each family's Einstein tensor is derived in closed form, and every design is held to the null, weak, strong and dominant energy conditions for every observer at every point, with no equation of state. Searches by sequential linear programming find the best design at each mass, `verify` checks every saved design again on a finer grid, and `flight` takes a closed-form rocket shell from rest to a chosen speed. The results are in `results/shells.json`, for walls from R1 to 2 R1 with masses in units of R1, and `results/shells.png` draws them.
+`nacelle shells` builds shells of positive-energy matter around a flat cavity in three metric families: a stationary shell whose wall carries a shift, so that the cavity drifts relative to it; an accelerating shell on a radiation exhaust whose cavity accelerates with it; and an accelerating hull whose exhaust is aimed by the shape of its wavefronts, around a cavity that stays inertial. Each family's Einstein tensor is derived in closed form. Searches by sequential linear programming find the best design at each mass and hold it, at the points of a grid over its wall, to the null, weak, strong and dominant energy conditions for every observer, with no equation of state, or to the null and weak ones alone where the drift table says so; `verify` checks every saved design again on a finer grid, and `flight` takes a closed-form rocket shell from rest to a chosen speed. At each mass of the drift table where all four conditions hold, `certifiable` finds the closed-form drag shell of greatest drift whose certificate holds, and at each mass of the acceleration table the rocket shell of greatest acceleration whose certificate holds, and `nacelle.v` proves that each meets the null, weak, strong and dominant conditions at every point. The results are in `results/shells.json`, for walls from R1 to 2 R1 with masses in units of R1, and `results/shells.png` draws them.
 
-The drift of the cavity's free-fall frame relative to the shell, as a fraction of the local light speed:
+The drift of the cavity's free-fall frame relative to the shell, as a fraction of the local light speed, for the best design of each search and for the closed-form drag shell at the same mass that `nacelle.v` proves:
 
-| M | compactness | drift | cavity lapse | conditions |
-|---|---|---|---|---|
-| 1.00 | 0.640 | 0.310 | 0.485 | all four |
-| 1.30 | 0.741 | 0.404 | 0.389 | all four |
-| 1.60 | 0.816 | 0.503 | 0.300 | all four |
-| 2.00 | 0.889 | 0.805 | 0.142 | null and weak |
-| 2.60 | 0.955 | 0.794 | 0.051 | null and weak |
+| M | compactness | drift | cavity lapse | conditions | proved drift |
+|---|---|---|---|---|---|
+| 1.00 | 0.640 | 0.310 | 0.485 | all four | 0.164 |
+| 1.30 | 0.741 | 0.404 | 0.389 | all four | 0.213 |
+| 1.60 | 0.816 | 0.503 | 0.300 | all four | 0.253 |
+| 2.00 | 0.889 | 0.805 | 0.142 | null and weak | |
+| 2.60 | 0.955 | 0.794 | 0.051 | null and weak | |
 
-The largest acceleration with a weightless cavity, against GM/3R1^2, the largest uniform field a shell of non-negative density gives a cavity in Newtonian gravity, for the rocket shell on its exhaust and the beam hull on an aimed exhaust of six Legendre modes. The efficiency M a / (-M_u) is 1 for an ideal photon rocket.
+The largest acceleration with a weightless cavity, against GM/3R1^2, the largest uniform field a shell of non-negative density gives a cavity in Newtonian gravity, for the rocket shell on its exhaust and the beam hull on an aimed exhaust of six Legendre modes, and the acceleration of the rocket shell at the same mass that `nacelle.v` proves. The efficiency M a / (-M_u) is 1 for an ideal photon rocket.
 
-| M | rocket a R1^2 / M | share of GM/3R1^2 | beam a R1^2 / M | share of GM/3R1^2 | beam efficiency | mass kept at 0.9 c |
-|---|---|---|---|---|---|---|
-| 0.05 | 0.126 | 0.38 | 0.116 | 0.35 | 0.689 | 0.118 |
-| 0.10 | 0.132 | 0.39 | 0.115 | 0.35 | 0.688 | 0.118 |
-| 0.20 | 0.138 | 0.41 | 0.114 | 0.34 | 0.687 | 0.117 |
-| 0.40 | 0.133 | 0.40 | 0.148 | 0.44 | 0.680 | 0.115 |
+| M | rocket a R1^2 / M | share of GM/3R1^2 | beam a R1^2 / M | share of GM/3R1^2 | beam efficiency | mass kept at 0.9 c | proved rocket a R1^2 / M |
+|---|---|---|---|---|---|---|---|
+| 0.05 | 0.126 | 0.38 | 0.116 | 0.35 | 0.689 | 0.118 | 0.057 |
+| 0.10 | 0.132 | 0.39 | 0.115 | 0.35 | 0.688 | 0.118 | 0.060 |
+| 0.20 | 0.138 | 0.41 | 0.114 | 0.34 | 0.687 | 0.117 | 0.054 |
+| 0.40 | 0.133 | 0.40 | 0.148 | 0.44 | 0.680 | 0.115 | 0.051 |
 
 The closed-form rocket shell flown from rest with the least exhaust its family allows, every condition checked at 81 instants of the burn:
 
@@ -48,7 +48,9 @@ The closed-form rocket shell flown from rest with the least exhaust its family a
 
 ## Proofs
 
-`nacelle.v` proves the energy conditions of a Hawking-Ellis type I tensor, that the Maxwell stress tensor obeys the null and dominant conditions, and the flat-slice theorem: with flat spatial slices and any lapse, the integral of `alpha^2 rho` is minus the integral of `|curl beta|^2` over 32 pi, so such a spacetime cannot be built from positive energy. Its certificate theorems give all four energy conditions from two diagonally dominant matrix pencils, or from Sylvester's criterion on them, for every causal vector. The face theorem shows that the dominant condition keeps a cavity's drift below the local light speed where a wall meets its cavity, and the last part of the file, written by `nacelle shells certify`, proves the four conditions at every point of the walls of a closed-form drag shell, a closed-form rocket shell and the drag shell that `nacelle shells certifiable` finds, the one of greatest drift whose certificate rows hold with a set margin. The command writes out the expression trees that Interval's tactic would build, and the kernel runs Interval's bisection on them.
+`nacelle.v` proves the energy conditions of a Hawking-Ellis type I tensor, that the Maxwell stress tensor obeys the null and dominant conditions, and the flat-slice theorem: with flat spatial slices and any lapse, the integral of `alpha^2 rho` is minus the integral of `|curl beta|^2` over 32 pi, so such a spacetime cannot be built from positive energy. It proves the theorem for integrals with the properties of one over a periodic domain, and again on the three-torus with Coquelicot's integrals, for every shift whose components are trigonometric polynomials. Its certificate theorems give all four energy conditions from two diagonally dominant matrix pencils, or from Sylvester's criterion on them, for every causal vector. The face theorem shows that the dominant condition keeps a cavity's drift from exceeding the local light speed where a wall meets its cavity, and that face data drifting at the light speed itself meet every condition, so no bound below it follows there.
+
+The last part of the file is written by `nacelle shells certify`. It computes the Einstein tensors of the drag family's metric and of the rocket family's without the dipole of its lapse: the Christoffel symbols, their derivatives and the Ricci tensor from the metric's components and their first and second derivatives along the coordinates, taken by the chain rule over the profiles' jets, all as Laurent polynomials in the jets evaluated by reflection in the kernel. It proves each equal on its family's frame to the closed forms G_* that the certificates take. It proves the four conditions at every point off the centre of a closed-form drag shell, a closed-form rocket shell and the shells that `nacelle shells certifiable` finds, the drag shells at the masses of the drift table and the rocket shells at those of the acceleration table, each the one of greatest drift or acceleration whose certificate rows hold with a set margin: in the wall, in the flat cavity and in the exterior, which is empty around the drag shells and holds the rocket's exhaust, with the metric matched across both faces. It also proves that the rocket shells' jets in retarded time are those their exhaust's evolution gives. The command writes out the expression trees that Interval's tactic would build, and the kernel runs Interval's bisection on them in two levels: the radial functions are enclosed once on each cell of r by their mean-value form, and each row is bisected in the angle with those enclosures held. Interval's programs run there on persistent arrays indexed by machine integers, which compute the values Interval's own evaluator does.
 
 ## Set-up
 
