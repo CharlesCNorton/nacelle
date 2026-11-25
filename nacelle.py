@@ -8753,7 +8753,7 @@ def face_module():
 
 # The Einstein tensor from a metric's components and their derivatives by the curvature formulas, and the same
 # computed on Laurent polynomials by reflection, which proves it equal to a family's G_* on its frame.
-LP_LEMMAS = r"""From Stdlib Require Import QArith Qreals.
+LP_LEMMAS = r"""From Stdlib Require Import ZArith QArith Qreals.
 Local Open Scope R_scope.
 
 (* The Einstein tensor at a point from the metric's components g, its inverse gi and their first and second
@@ -9425,6 +9425,356 @@ Proof.
   rewrite (rx_norm_correct A O HA e1 p E1), (rx_norm_correct A O HA e2 q E2).
   exact (lp_zero_eq A O p q H).
 Qed.
+
+(* The formal derivatives are partial derivatives.  The variables are functions of a point x : nat -> R; where each
+   variable the polynomials use has the partial derivatives its rules give, the formal derivative of a Laurent
+   polynomial is its partial derivative along each coordinate, and those of the metric give the Einstein tensor of
+   its partial derivatives. *)
+Lemma is_derive_mult_R (f g : R -> R) x df dg : is_derive f x df -> is_derive g x dg ->
+  is_derive (fun t => f t * g t) x (df * g x + f x * dg).
+Proof. intros Hf Hg. exact (is_derive_mult f g x df dg Hf Hg (fun n m => Rmult_comm n m)). Qed.
+
+Lemma is_derive_plus_R (f g : R -> R) x df dg : is_derive f x df -> is_derive g x dg ->
+  is_derive (fun t => f t + g t) x (df + dg).
+Proof. intros Hf Hg. exact (is_derive_plus f g x df dg Hf Hg). Qed.
+
+Lemma is_derive_const_R (a x : R) : is_derive (fun _ => a) x 0.
+Proof. exact (is_derive_const a x). Qed.
+
+Lemma is_derive_eq (f : R -> R) (x l l' : R) : l = l' -> is_derive f x l -> is_derive f x l'.
+Proof. intros <-. exact (fun h => h). Qed.
+
+Lemma is_derive_flat (f : R -> R) (x a l : R) : (forall t, f t = a) -> l = 0 -> is_derive f x l.
+Proof. intros Hf ->. apply (is_derive_ext (fun _ => a)); [intros t; symmetry; apply Hf | apply is_derive_const_R]. Qed.
+
+Lemma is_derive_powerRZ (f : R -> R) t d e : f t <> 0 -> is_derive f t d ->
+  is_derive (fun u => powerRZ (f u) e) t (IZR e * powerRZ (f t) (e - 1) * d).
+Proof.
+  intros Hf Hd. destruct e as [| p | p].
+  - apply (is_derive_flat _ _ 1); [intros u; reflexivity | simpl; ring].
+  - remember (Pos.to_nat p) as n eqn:En. assert (Hn : (0 < n)%nat) by (subst; apply Pos2Nat.is_pos).
+    apply (is_derive_ext (fun u => f u ^ n)); [intros u; cbn [powerRZ]; rewrite En; reflexivity |].
+    apply (is_derive_eq _ _ (INR n * d * f t ^ Init.Nat.pred n)); [| apply is_derive_pow, Hd].
+    replace (Z.pos p - 1)%Z with (Z.of_nat (Init.Nat.pred n)) by lia. rewrite <- pow_powerRZ.
+    replace (IZR (Z.pos p)) with (INR n) by (rewrite INR_IZR_INZ; subst; rewrite positive_nat_Z; reflexivity). ring.
+  - remember (Pos.to_nat p) as n eqn:En. assert (Hn : (0 < n)%nat) by (subst; apply Pos2Nat.is_pos).
+    assert (Hg : f t ^ n <> 0) by (apply pow_nonzero; exact Hf).
+    apply (is_derive_ext (fun u => / f u ^ n)); [intros u; cbn [powerRZ]; rewrite En; reflexivity |].
+    apply (is_derive_eq _ _ (- (INR n * d * f t ^ Init.Nat.pred n) / (f t ^ n) ^ 2));
+      [| apply (is_derive_inv (fun u => f u ^ n)); [apply is_derive_pow, Hd | exact Hg]].
+    replace (Z.neg p - 1)%Z with (- Z.of_nat (S n))%Z by lia. rewrite powerRZ_neg', <- pow_powerRZ.
+    replace (IZR (Z.neg p)) with (- INR n) by (rewrite IZR_NEG, INR_IZR_INZ; subst; rewrite positive_nat_Z; reflexivity).
+    destruct n as [| m]; [lia |]. cbn [pow Init.Nat.pred].
+    field; repeat split; first [exact Hf | apply pow_nonzero; exact Hf].
+Qed.
+
+(* the derivative of each kind of product, the variables' values vs and their derivatives ds *)
+Fixpoint zdsum (vs ds : list R) (es : list Z) : R :=
+  match vs, es with
+  | v :: vs', e :: es' => IZR e * powerRZ v (e - 1) * hd 0 ds * zev vs' es' + powerRZ v e * zdsum vs' (tl ds) es'
+  | _, _ => 0
+  end.
+
+Fixpoint ndsum (vs ds : list R) (es : list nat) : R :=
+  match vs, es with
+  | v :: vs', e :: es' => INR e * v ^ (e - 1) * hd 0 ds * nev vs' es' + v ^ e * ndsum vs' (tl ds) es'
+  | _, _ => 0
+  end.
+
+Definition vals (fs : list (R -> R)) (u : R) : list R := map (fun f => f u) fs.
+
+Lemma nth_tl (ds : list R) i : nth (S i) ds 0 = nth i (tl ds) 0.
+Proof. destruct ds; [destruct i |]; reflexivity. Qed.
+
+Lemma zev_derive fs ds es t :
+  (forall i, (i < length fs)%nat -> (i < length es)%nat -> nth i es 0%Z <> 0%Z ->
+     nth i fs (fun _ => 1) t <> 0 /\ is_derive (nth i fs (fun _ => 1)) t (nth i ds 0)) ->
+  is_derive (fun u => zev (vals fs u) es) t (zdsum (vals fs t) ds es).
+Proof.
+  revert ds es. induction fs as [| f fs IH]; intros ds es H;
+    [apply (is_derive_flat _ _ 1); reflexivity |].
+  destruct es as [| e es]; [apply (is_derive_flat _ _ 1); reflexivity |]. cbn [vals map zev zdsum].
+  apply (is_derive_eq _ _ ((IZR e * powerRZ (f t) (e - 1) * hd 0 ds) * zev (vals fs t) es
+                           + powerRZ (f t) e * zdsum (vals fs t) (tl ds) es)); [unfold vals; ring |].
+  apply is_derive_mult_R.
+  - destruct (Z.eq_dec e 0) as [-> | He].
+    + apply (is_derive_flat _ _ 1); [intros u; reflexivity | simpl; ring].
+    + destruct (H 0%nat ltac:(cbn [length]; lia) ltac:(cbn [length]; lia) He) as [Hf Hd]. cbn [nth] in Hf, Hd.
+      replace (hd 0 ds) with (nth 0 ds 0) by (destruct ds; reflexivity). apply is_derive_powerRZ; assumption.
+  - apply IH. intros i Hi Hi' Hz.
+    destruct (H (S i) ltac:(cbn [length]; lia) ltac:(cbn [length]; lia) Hz) as [Hf Hd]. cbn [nth] in Hf, Hd.
+    rewrite <- nth_tl. split; assumption.
+Qed.
+
+Lemma nev_derive gs ds es t :
+  (forall i, (i < length gs)%nat -> (i < length es)%nat -> nth i es 0%nat <> 0%nat ->
+     is_derive (nth i gs (fun _ => 1)) t (nth i ds 0)) ->
+  is_derive (fun u => nev (vals gs u) es) t (ndsum (vals gs t) ds es).
+Proof.
+  revert ds es. induction gs as [| g gs IH]; intros ds es H;
+    [apply (is_derive_flat _ _ 1); reflexivity |].
+  destruct es as [| e es]; [apply (is_derive_flat _ _ 1); reflexivity |]. cbn [vals map nev ndsum].
+  apply (is_derive_eq _ _ ((INR e * g t ^ (e - 1) * hd 0 ds) * nev (vals gs t) es
+                           + g t ^ e * ndsum (vals gs t) (tl ds) es)); [unfold vals; ring |].
+  apply is_derive_mult_R.
+  - destruct (Nat.eq_dec e 0) as [-> | He].
+    + apply (is_derive_flat _ _ 1); [intros u; reflexivity | simpl; ring].
+    + pose proof (H 0%nat ltac:(cbn [length]; lia) ltac:(cbn [length]; lia) He) as Hd. cbn [nth] in Hd.
+      apply (is_derive_eq _ _ (INR e * nth 0 ds 0 * g t ^ Init.Nat.pred e)); [| apply is_derive_pow, Hd].
+      replace (e - 1)%nat with (Init.Nat.pred e) by lia. replace (hd 0 ds) with (nth 0 ds 0) by (destruct ds; reflexivity).
+      ring.
+  - apply IH. intros i Hi Hi' Hz. rewrite <- nth_tl.
+    exact (H (S i) ltac:(cbn [length]; lia) ltac:(cbn [length]; lia) Hz).
+Qed.
+
+(* the formal derivative of a monomial evaluates to those sums *)
+Lemma lev_fold A O ps : lev A O (fold_right lp_add nil ps) = fold_right Rplus 0 (map (lev A O) ps).
+Proof. induction ps as [| p ps IH]; cbn [fold_right map]; [reflexivity | rewrite lev_add, IH; reflexivity]. Qed.
+
+Lemma fold_app (l1 l2 : list R) : fold_right Rplus 0 (l1 ++ l2) = fold_right Rplus 0 l1 + fold_right Rplus 0 l2.
+Proof. induction l1 as [| a l1 IH]; cbn [app fold_right]; [ring | rewrite IH; ring]. Qed.
+
+Lemma fold_scal (k : R) (f : nat -> R) l :
+  fold_right Rplus 0 (map (fun i => k * f i) l) = k * fold_right Rplus 0 (map f l).
+Proof. induction l as [| a l IH]; cbn [map fold_right]; [ring | rewrite IH; ring]. Qed.
+
+Lemma Q2R_inject z : Q2R (inject_Z z) = IZR z.
+Proof. unfold Q2R, inject_Z. simpl. field. Qed.
+
+Lemma zsum_index vs ds es : (length es <= length vs)%nat ->
+  fold_right Rplus 0 (map (fun i => IZR (nth i es 0%Z) * zev vs (zdec i es) * nth i ds 0) (seq 0 (length es)))
+  = zdsum vs ds es.
+Proof.
+  revert vs ds. induction es as [| e es IH]; intros vs ds Hl; [destruct vs; reflexivity |].
+  destruct vs as [| v vs]; [cbn [length] in Hl; lia |]. cbn [length] in Hl.
+  cbn [length seq map fold_right]. rewrite <- seq_shift, map_map.
+  rewrite (map_ext (fun i => IZR (nth (S i) (e :: es) 0%Z) * zev (v :: vs) (zdec (S i) (e :: es)) * nth (S i) ds 0)
+                   (fun i => powerRZ v e * (IZR (nth i es 0%Z) * zev vs (zdec i es) * nth i (tl ds) 0)))
+    by (intros i; cbn [nth zdec zev]; rewrite nth_tl; ring).
+  rewrite fold_scal, IH by lia. cbn [nth zdec zev zdsum]. replace (nth 0 ds 0) with (hd 0 ds) by (destruct ds; reflexivity).
+  ring.
+Qed.
+
+Lemma nsum_index vs ds es : (length es <= length vs)%nat ->
+  fold_right Rplus 0 (map (fun i => INR (nth i es 0%nat) * nev vs (ndec i es) * nth i ds 0) (seq 0 (length es)))
+  = ndsum vs ds es.
+Proof.
+  revert vs ds. induction es as [| e es IH]; intros vs ds Hl; [destruct vs; reflexivity |].
+  destruct vs as [| v vs]; [cbn [length] in Hl; lia |]. cbn [length] in Hl.
+  cbn [length seq map fold_right]. rewrite <- seq_shift, map_map.
+  rewrite (map_ext (fun i => INR (nth (S i) (e :: es) 0%nat) * nev (v :: vs) (ndec (S i) (e :: es)) * nth (S i) ds 0)
+                   (fun i => v ^ e * (INR (nth i es 0%nat) * nev vs (ndec i es) * nth i (tl ds) 0)))
+    by (intros i; cbn [nth ndec nev]; rewrite nth_tl; ring).
+  rewrite fold_scal, IH by lia. cbn [nth ndec nev ndsum]. replace (nth 0 ds 0) with (hd 0 ds) by (destruct ds; reflexivity).
+  ring.
+Qed.
+
+Lemma map_nth_lev A O (rs : list lp) i : nth i (map (lev A O) rs) 0 = lev A O (nth i rs nil).
+Proof. change 0 with (lev A O nil). apply map_nth. Qed.
+
+Lemma lev_dmono A O rA rO m : List.Forall (fun x => x <> 0) A ->
+  (length (fst m) <= length A)%nat -> (length (snd m) <= length O)%nat ->
+  lev A O (dmono rA rO m) = zdsum A (map (lev A O) rA) (fst m) * nev O (snd m)
+                            + zev A (fst m) * ndsum O (map (lev A O) rO) (snd m).
+Proof.
+  intros HA HlA HlO. destruct m as [za no]. cbn [fst snd] in *. unfold dmono. cbn [fst snd].
+  rewrite lev_fold, map_app, fold_app, !map_map.
+  rewrite (map_ext (fun i => lev A O (lp_tmul ((zdec i za, no), inject_Z (nth i za 0%Z)) (nth i rA nil)))
+                   (fun i => nev O no * (IZR (nth i za 0%Z) * zev A (zdec i za) * nth i (map (lev A O) rA) 0)))
+    by (intros i; rewrite lev_tmul by exact HA; cbn [fst snd]; unfold mev; cbn [fst snd];
+        rewrite Q2R_inject, map_nth_lev; ring).
+  rewrite (map_ext (fun j => lev A O (lp_tmul ((za, ndec j no), inject_Z (Z.of_nat (nth j no 0%nat))) (nth j rO nil)))
+                   (fun j => zev A za * (INR (nth j no 0%nat) * nev O (ndec j no) * nth j (map (lev A O) rO) 0)))
+    by (intros j; rewrite lev_tmul by exact HA; cbn [fst snd]; unfold mev; cbn [fst snd];
+        rewrite Q2R_inject, <- INR_IZR_INZ, map_nth_lev; ring).
+  rewrite !fold_scal, zsum_index, nsum_index by assumption. ring.
+Qed.
+
+(* the variables a polynomial uses, and the lengths of its monomials *)
+Fixpoint zok (marks : list bool) (es : list Z) : bool :=
+  match es with nil => true | e :: es' => (Z.eqb e 0 || hd false marks) && zok (tl marks) es' end.
+Fixpoint nok (marks : list bool) (es : list nat) : bool :=
+  match es with nil => true | e :: es' => (Nat.eqb e 0 || hd false marks) && nok (tl marks) es' end.
+Definition lp_ok (mA mO : list bool) (na no : nat) (p : lp) : bool :=
+  forallb (fun t => zok mA (fst (fst t)) && nok mO (snd (fst t)) && Nat.leb (length (fst (fst t))) na
+                    && Nat.leb (length (snd (fst t))) no) p.
+
+Lemma zok_nth marks es i : zok marks es = true -> nth i es 0%Z <> 0%Z -> nth i marks false = true.
+Proof.
+  revert marks i. induction es as [| e es IH]; intros marks i H Hz; [destruct i; contradiction |].
+  cbn [zok] in H. apply andb_true_iff in H as [H1 H2]. destruct i as [| i].
+  - cbn [nth] in Hz. apply orb_true_iff in H1 as [H1 | H1]; [apply Z.eqb_eq in H1; contradiction |].
+    destruct marks; [discriminate | exact H1].
+  - cbn [nth] in Hz |- *. destruct marks as [| b marks]; [| exact (IH marks i H2 Hz)].
+    pose proof (IH nil i H2 Hz) as F. destruct i; discriminate.
+Qed.
+
+Lemma nok_nth marks es i : nok marks es = true -> nth i es 0%nat <> 0%nat -> nth i marks false = true.
+Proof.
+  revert marks i. induction es as [| e es IH]; intros marks i H Hz; [destruct i; contradiction |].
+  cbn [nok] in H. apply andb_true_iff in H as [H1 H2]. destruct i as [| i].
+  - cbn [nth] in Hz. apply orb_true_iff in H1 as [H1 | H1]; [apply Nat.eqb_eq in H1; contradiction |].
+    destruct marks; [discriminate | exact H1].
+  - cbn [nth] in Hz |- *. destruct marks as [| b marks]; [| exact (IH marks i H2 Hz)].
+    pose proof (IH nil i H2 Hz) as F. destruct i; discriminate.
+Qed.
+
+Lemma Forall_nth_nonzero (vs : list R) i : List.Forall (fun x => x <> 0) vs -> (i < length vs)%nat -> nth i vs 1 <> 0.
+Proof. intros H Hi. apply (proj1 (Forall_nth _ vs) H i 1 Hi). Qed.
+
+Lemma nth_vals (fs : list (R -> R)) i u : (i < length fs)%nat -> nth i (vals fs u) 1 = nth i fs (fun _ => 1) u.
+Proof.
+  revert i. induction fs as [| f fs IH]; intros [| i] Hi; cbn [length] in Hi; try lia; [reflexivity |].
+  cbn [vals map nth]. apply IH. lia.
+Qed.
+
+Lemma nth_line (Fs : list ((nat -> R) -> R)) (h : R -> nat -> R) i :
+  (i < length Fs)%nat -> nth i (map (fun F => fun u => F (h u)) Fs) (fun _ => 1) = fun u => nth i Fs (fun _ => 1) (h u).
+Proof.
+  revert i. induction Fs as [| F Fs IH]; intros [| i] Hi; cbn [length] in Hi; try lia; [reflexivity |].
+  cbn [map nth]. apply IH. lia.
+Qed.
+
+(* a polynomial in variables of the point, with partial derivatives along a coordinate *)
+Section Partials.
+Variables (FA FO : list ((nat -> R) -> R)) (mA mO : list bool) (rules : nat -> list lp * list lp)
+  (Dom : (nat -> R) -> Prop).
+
+Definition upd (x : nat -> R) (k : nat) (t : R) : nat -> R := fun i => if Nat.eqb i k then t else x i.
+
+Lemma upd_same x k : upd x k (x k) = x.
+Proof. apply functional_extensionality. intros i. unfold upd. destruct (Nat.eqb_spec i k); [subst |]; reflexivity. Qed.
+
+Definition at_point (Fs : list ((nat -> R) -> R)) (x : nat -> R) : list R := map (fun F => F x) Fs.
+
+(* where the variables live: on a set open along each coordinate, with the atoms nonzero, and each variable that the
+   marks name with the partial derivatives its rules give *)
+Definition rules_hold : Prop :=
+  (forall x l, Dom x -> locally (x l) (fun t => Dom (upd x l t))) /\
+  (forall x, Dom x -> List.Forall (fun v => v <> 0) (at_point FA x)) /\
+  (forall x k i, Dom x -> (i < length FA)%nat -> nth i mA false = true ->
+     is_derive (fun t => nth i FA (fun _ => 1) (upd x k t)) (x k)
+               (lev (at_point FA x) (at_point FO x) (nth i (fst (rules k)) nil))) /\
+  (forall x k j, Dom x -> (j < length FO)%nat -> nth j mO false = true ->
+     is_derive (fun t => nth j FO (fun _ => 1) (upd x k t)) (x k)
+               (lev (at_point FA x) (at_point FO x) (nth j (snd (rules k)) nil))).
+
+Hypothesis HR : rules_hold.
+
+Lemma line_vals (Fs : list ((nat -> R) -> R)) x k t :
+  at_point Fs (upd x k t) = vals (map (fun F => fun u => F (upd x k u)) Fs) t.
+Proof. unfold at_point, vals. rewrite map_map. reflexivity. Qed.
+
+Lemma partial_lev p x k : Dom x -> lp_ok mA mO (length FA) (length FO) p = true ->
+  is_derive (fun t => lev (at_point FA (upd x k t)) (at_point FO (upd x k t)) p) (x k)
+            (lev (at_point FA x) (at_point FO x) (lp_deriv (fst (rules k)) (snd (rules k)) p)).
+Proof.
+  destruct HR as [_ [Hnz [HdA HdO]]]. intros Hx Hok.
+  set (fs := map (fun F => fun u => F (upd x k u)) FA). set (gs := map (fun F => fun u => F (upd x k u)) FO).
+  assert (EA : at_point FA x = vals fs (x k)) by (unfold fs; rewrite <- line_vals, upd_same; reflexivity).
+  assert (EO : at_point FO x = vals gs (x k)) by (unfold gs; rewrite <- line_vals, upd_same; reflexivity).
+  apply (is_derive_ext (fun t => lev (vals fs t) (vals gs t) p)); [intros t; unfold fs, gs; rewrite !line_vals; reflexivity |].
+  assert (HA : List.Forall (fun v => v <> 0) (vals fs (x k))) by (rewrite <- EA; exact (Hnz x Hx)).
+  assert (LA : length (vals fs (x k)) = length FA) by (unfold vals, fs; rewrite !length_map; reflexivity).
+  assert (LO : length (vals gs (x k)) = length FO) by (unfold vals, gs; rewrite !length_map; reflexivity).
+  rewrite EA, EO. induction p as [| [m q] p IH]; [apply (is_derive_flat _ _ 0); reflexivity |].
+  cbn [lp_ok forallb] in Hok. apply andb_true_iff in Hok as [Hm Hok].
+  apply andb_true_iff in Hm as [Hm HlO]. apply andb_true_iff in Hm as [Hm HlA]. apply andb_true_iff in Hm as [Hz Hn].
+  apply Nat.leb_le in HlA, HlO. cbn [fst snd] in Hz, Hn, HlA, HlO.
+  cbn [lev lp_deriv fold_right]. rewrite lev_add, lev_tmul by exact HA. cbn [fst snd]. rewrite mev_one.
+  rewrite lev_dmono by (try exact HA; lia). fold (lp_deriv (fst (rules k)) (snd (rules k)) p).
+  apply is_derive_plus_R; [| apply IH; exact Hok].
+  apply (is_derive_eq _ _ (Q2R q * (zdsum (vals fs (x k)) (map (lev (vals fs (x k)) (vals gs (x k))) (fst (rules k))) (fst m)
+                                    * nev (vals gs (x k)) (snd m)
+                                    + zev (vals fs (x k)) (fst m)
+                                    * ndsum (vals gs (x k)) (map (lev (vals fs (x k)) (vals gs (x k))) (snd (rules k))) (snd m))));
+    [ring |].
+  apply is_derive_scal. unfold mev. apply is_derive_mult_R.
+  - apply zev_derive. intros i Hi Hi' Hz0. pose proof (zok_nth _ _ _ Hz Hz0) as Hmark.
+    assert (Hi2 : (i < length FA)%nat) by (unfold fs in Hi; rewrite length_map in Hi; exact Hi).
+    split.
+    + pose proof (Forall_nth_nonzero _ i HA ltac:(unfold vals; rewrite length_map; exact Hi)) as Hv.
+      rewrite nth_vals in Hv by exact Hi. exact Hv.
+    + rewrite map_nth_lev, <- EA, <- EO. unfold fs. rewrite nth_line by exact Hi2.
+      exact (HdA x k i Hx Hi2 Hmark).
+  - apply nev_derive. intros j Hj Hj' Hz0. pose proof (nok_nth _ _ _ Hn Hz0) as Hmark.
+    assert (Hj2 : (j < length FO)%nat) by (unfold gs in Hj; rewrite length_map in Hj; exact Hj).
+    rewrite map_nth_lev, <- EA, <- EO. unfold gs. rewrite nth_line by exact Hj2. exact (HdO x k j Hx Hj2 Hmark).
+Qed.
+
+Lemma partial2_lev p x k l : Dom x -> lp_ok mA mO (length FA) (length FO) p = true ->
+  lp_ok mA mO (length FA) (length FO) (lp_deriv (fst (rules k)) (snd (rules k)) p) = true ->
+  is_derive (fun t => Derive (fun t' => lev (at_point FA (upd (upd x l t) k t')) (at_point FO (upd (upd x l t) k t')) p)
+                             (upd x l t k)) (x l)
+            (lev (at_point FA x) (at_point FO x)
+                 (lp_deriv (fst (rules l)) (snd (rules l)) (lp_deriv (fst (rules k)) (snd (rules k)) p))).
+Proof.
+  intros Hx Hok Hok'. destruct HR as [Hopen _].
+  apply (is_derive_ext_loc (fun t => lev (at_point FA (upd x l t)) (at_point FO (upd x l t))
+                                         (lp_deriv (fst (rules k)) (snd (rules k)) p))).
+  - apply (filter_imp (fun t => Dom (upd x l t))); [| exact (Hopen x l Hx)].
+    intros t Ht. symmetry. apply is_derive_unique. exact (partial_lev p (upd x l t) k Ht Hok).
+  - exact (partial_lev _ x l Hx Hok').
+Qed.
+
+(* the Einstein tensor of the metric's partial derivatives is that of its formal derivatives *)
+Theorem along_partials g gi va vb x : Dom x ->
+  (forall a b, (a < 4)%nat -> (b < 4)%nat -> lp_ok mA mO (length FA) (length FO) (g a b) = true /\
+     forall k, (k < 4)%nat -> lp_ok mA mO (length FA) (length FO) (jet1 g rules a b k) = true) ->
+  along (fun a b => lev (at_point FA x) (at_point FO x) (g a b)) (fun a b => lev (at_point FA x) (at_point FO x) (gi a b))
+    (fun a b k => Derive (fun t => lev (at_point FA (upd x k t)) (at_point FO (upd x k t)) (g a b)) (x k))
+    (fun a b k l => Derive (fun t => Derive (fun t' => lev (at_point FA (upd (upd x l t) k t'))
+                                                           (at_point FO (upd (upd x l t) k t')) (g a b)) (upd x l t k)) (x l))
+    (fun a => lev (at_point FA x) (at_point FO x) (va a)) (fun b => lev (at_point FA x) (at_point FO x) (vb b))
+  = along (fun a b => lev (at_point FA x) (at_point FO x) (g a b)) (fun a b => lev (at_point FA x) (at_point FO x) (gi a b))
+    (fun a b k => lev (at_point FA x) (at_point FO x) (jet1 g rules a b k))
+    (fun a b k l => lev (at_point FA x) (at_point FO x) (jet2 g rules a b k l))
+    (fun a => lev (at_point FA x) (at_point FO x) (va a)) (fun b => lev (at_point FA x) (at_point FO x) (vb b)).
+Proof.
+  intros Hx Hok. apply along_ext; intros; try reflexivity.
+  - apply is_derive_unique. unfold jet1. apply partial_lev; [exact Hx | apply Hok; assumption].
+  - apply is_derive_unique. unfold jet2, jet1. apply partial2_lev; [exact Hx | apply Hok; assumption |].
+    apply (proj2 (Hok a b ltac:(assumption) ltac:(assumption)) k ltac:(assumption)).
+Qed.
+End Partials.
+
+(* the Einstein tensor at the point x of the metric g whose components are functions of the point, from its first and
+   second partial derivatives in Coquelicot's sense, on two vectors *)
+Definition einstein_at (g gi : nat -> nat -> lp) (FA FO : list ((nat -> R) -> R)) (x : nat -> R) (va vb : nat -> lp) : R :=
+  along (fun a b => lev (at_point FA x) (at_point FO x) (g a b)) (fun a b => lev (at_point FA x) (at_point FO x) (gi a b))
+    (fun a b k => Derive (fun t => lev (at_point FA (upd x k t)) (at_point FO (upd x k t)) (g a b)) (x k))
+    (fun a b k l => Derive (fun t => Derive (fun t' => lev (at_point FA (upd (upd x l t) k t'))
+                                                           (at_point FO (upd (upd x l t) k t')) (g a b)) (upd x l t k)) (x l))
+    (fun a => lev (at_point FA x) (at_point FO x) (va a)) (fun b => lev (at_point FA x) (at_point FO x) (vb b)).
+
+(* the metric and its formal first derivatives use only the marked variables *)
+Definition metric_ok (mA mO : list bool) (na no : nat) (g : nat -> nat -> lp) (rules : nat -> list lp * list lp) : bool :=
+  forallb (fun a => forallb (fun b => lp_ok mA mO na no (g a b)
+                                       && forallb (fun k => lp_ok mA mO na no (jet1 g rules a b k)) (seq 0 4)) (seq 0 4))
+          (seq 0 4).
+
+Lemma metric_ok_all mA mO na no g rules : metric_ok mA mO na no g rules = true ->
+  forall a b, (a < 4)%nat -> (b < 4)%nat -> lp_ok mA mO na no (g a b) = true /\
+    forall k, (k < 4)%nat -> lp_ok mA mO na no (jet1 g rules a b k) = true.
+Proof.
+  intros H a b Ha Hb.
+  pose proof (proj1 (forallb_forall _ _) H a ltac:(apply in_seq; lia)) as Ha'.
+  pose proof (proj1 (forallb_forall _ _) Ha' b ltac:(apply in_seq; lia)) as Hab.
+  apply andb_true_iff in Hab as [H1 H2]. split; [exact H1 |].
+  intros k Hk. exact (proj1 (forallb_forall _ _) H2 k ltac:(apply in_seq; lia)).
+Qed.
+
+Corollary einstein_at_formal FA FO mA mO rules Dom g gi va vb x :
+  rules_hold FA FO mA mO rules Dom -> Dom x -> metric_ok mA mO (length FA) (length FO) g rules = true ->
+  einstein_at g gi FA FO x va vb
+  = along (fun a b => lev (at_point FA x) (at_point FO x) (g a b)) (fun a b => lev (at_point FA x) (at_point FO x) (gi a b))
+      (fun a b k => lev (at_point FA x) (at_point FO x) (jet1 g rules a b k))
+      (fun a b k l => lev (at_point FA x) (at_point FO x) (jet2 g rules a b k l))
+      (fun a => lev (at_point FA x) (at_point FO x) (va a)) (fun b => lev (at_point FA x) (at_point FO x) (vb b)).
+Proof.
+  intros HR Hx Hok. unfold einstein_at.
+  apply (along_partials FA FO mA mO rules Dom HR); [exact Hx | apply metric_ok_all, Hok].
+Qed.
 """
 
 
@@ -9700,6 +10050,32 @@ def einstein_lines(family):
               "  change (rx_eval (%s) (%s) ast_%s) with (W_%s r c (s * s) %s)." % (A, O, t, t, " ".join(args)),
               "  unfold W_%s, G_%s. field; repeat split; first [assumption | apply pow_nonzero; assumption"
               " | apply Rmult_integral_contrapositive_currified; assumption]." % (t, t), "Qed.", ""]
+    # the same with the metric's partial derivatives, its variables functions of the point (x0, r, c, ph) whose own
+    # partial derivatives are those rules_t gives, but for the jets of second order, which nothing differentiates
+    marksA = ["true"] * len(atoms)
+    marksO = ["true"] + ["true" if len(str(v).partition("_")[2]) < 2 else "false" for v in others[1:]]
+    FA, FO = " :: ".join(names) + " :: nil", " :: ".join(onames) + " :: nil"
+    L += ["(* the Einstein tensor of the metric's partial derivatives, where each variable but the jets of second order,",
+          "   as a function of the point, has the partial derivatives rules_t gives *)",
+          "Definition marksA : list bool := (%s :: nil)%%list." % " :: ".join(marksA),
+          "Definition marksO : list bool := (%s :: nil)%%list." % " :: ".join(marksO), "",
+          "Lemma ok_t : metric_ok marksA marksO %d %d g_t rules_t = true." % (len(atoms), len(others)),
+          "Proof. vm_compute. reflexivity. Qed.", ""]
+    for k in keys:
+        t = tag[k]
+        n2, n3 = power[k]
+        L += ["Theorem partials_%s (%s : (nat -> R) -> R) (Dom : (nat -> R) -> Prop) :" % (t, " ".join(names + onames)),
+              "  rules_hold (%s) (%s) marksA marksO rules_t Dom ->" % (FA, FO),
+              "  forall x s, Dom x -> %s x = s * s -> s <> 0 -> s * s = 1 - c x ^ 2 ->" % str(w),
+              "  %seinstein_at g_t gi_t (%s) (%s) x %s %s = %sG_%s (r x) (c x) s %s." % (
+                  "s ^ %d * " % n2 if n2 else "", FA, FO, F["names"][k[0]], F["names"][k[1]],
+                  "s ^ %d * " % n3 if n3 else "", t, " ".join("(%s x)" % a for a in args)),
+              "Proof.", "  intros HR x s Hx Hw Hs Hcs.",
+              "  rewrite (einstein_at_formal _ _ _ _ _ _ g_t gi_t %s %s x HR Hx ok_t)." % (
+                  F["names"][k[0]], F["names"][k[1]]),
+              "  destruct HR as [_ [Hnz _]]. pose proof (Hnz x Hx) as HA. cbn [at_point map] in HA |- *."]
+        L += ["  apply Forall_cons_iff in HA as [H%d HA]." % i for i in range(len(atoms) - 1)]
+        L += ["  rewrite Hw. apply einstein_%s; assumption." % t, "Qed.", ""]
     L += ["End %sEinstein." % cap, ""]
     return L
 
